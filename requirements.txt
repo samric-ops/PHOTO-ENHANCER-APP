@@ -4,4 +4,4 @@ numpy
 Pillow
 rembg
 onnxruntime
-scikit-image
+google-generativeai
