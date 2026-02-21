@@ -5,10 +5,13 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import io
 from rembg import remove
 import json
+import base64
 
 # Try to import Gemini, but don't fail if not installed
 try:
     import google.generativeai as genai
+    from google.generativeai.types import content_types
+    from google.generativeai import protos
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
@@ -72,11 +75,6 @@ def analyze_image_with_gemini(image, model):
         return None
     
     try:
-        # Convert PIL to bytes
-        img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format='JPEG', quality=95)
-        img_byte_arr = img_byte_arr.getvalue()
-        
         # Create prompt for Gemini
         prompt = """
         Analyze this ID photo and provide specific adjustments needed:
@@ -101,8 +99,8 @@ def analyze_image_with_gemini(image, model):
         }
         """
         
-        # Send to Gemini
-        response = model.generate_content([prompt, img_byte_arr])
+        # Send to Gemini - pass PIL Image directly, not bytes
+        response = model.generate_content([prompt, image])
         
         # Parse JSON response
         try:
@@ -120,6 +118,22 @@ def analyze_image_with_gemini(image, model):
     except Exception as e:
         st.error(f"Gemini analysis error: {str(e)}")
         return None
+
+def gemini_smart_enhance(image, adjustments):
+    """Apply smart adjustments based on Gemini analysis"""
+    if not adjustments:
+        return ultra_bright_enhance(image, 1.8)
+    
+    # Get adjustments from Gemini
+    brightness_boost = adjustments.get('adjustments', {}).get('brightness_boost', 20)
+    contrast_boost = adjustments.get('adjustments', {}).get('contrast_boost', 10)
+    
+    # Convert to multiplier
+    brightness_mult = 1.0 + (brightness_boost / 100)
+    contrast_mult = 1.0 + (contrast_boost / 100)
+    
+    # Apply enhancements
+    return ultra_bright_enhance(image, brightness_mult)
 
 # --- SMART ENHANCEMENT FUNCTIONS ---
 def smart_auto_enhance(image, brightness=1.2):
@@ -341,9 +355,27 @@ if uploaded_file:
             adjustments = None
             if enhance_mode == "🌐 Gemini AI Smart" and model:
                 with st.spinner("🤖 Gemini AI is analyzing your photo..."):
+                    # Pass PIL Image directly, not bytes
                     adjustments = analyze_image_with_gemini(img, model)
                     if adjustments:
                         st.success("✅ AI Analysis complete!")
+                        
+                        # Show analysis results
+                        with st.expander("📊 AI Analysis Results"):
+                            col_a1, col_a2 = st.columns(2)
+                            with col_a1:
+                                brightness_adj = adjustments.get('adjustments', {}).get('brightness_boost', 0)
+                                contrast_adj = adjustments.get('adjustments', {}).get('contrast_boost', 0)
+                                st.metric("Brightness Boost", f"+{brightness_adj}%")
+                                st.metric("Contrast Boost", f"+{contrast_adj}%")
+                            with col_a2:
+                                if adjustments.get('skin_tone_issues'):
+                                    st.write("Skin issues:", ", ".join(adjustments['skin_tone_issues']))
+                                if adjustments.get('lighting_issues'):
+                                    st.write("Lighting issues:", ", ".join(adjustments['lighting_issues']))
+                    else:
+                        st.warning("⚠️ Gemini analysis failed. Using Ultra Bright mode instead.")
+                        enhance_mode = "✨ Ultra Bright"  # Fallback to Ultra Bright
             
             # Create three columns
             col1, col2, col3 = st.columns(3, gap="large")
@@ -366,8 +398,7 @@ if uploaded_file:
                     
                     # Choose enhancement based on mode
                     if enhance_mode == "🌐 Gemini AI Smart" and adjustments:
-                        # Use Gemini adjustments (if implemented)
-                        enhanced_img = ultra_bright_enhance(img, 1.8)  # Fallback
+                        enhanced_img = gemini_smart_enhance(img, adjustments)
                         caption = "🤖 Gemini AI Enhanced"
                     elif enhance_mode == "✨ Ultra Bright":
                         enhanced_img = ultra_bright_enhance(img, brightness_level)
@@ -429,7 +460,7 @@ else:
         - ⚙️ **Standard Mode** - Natural na liwanag (1.0x to 2.0x)
         - 🎨 **Natural skin tones** - Hindi namumula
         - 📸 **Professional finish** - Parang studio quality
-        - 🤖 **Gemini AI ready** - Optional smart enhancement
+        - 🤖 **Gemini AI ready** - Smart enhancement
         
         **Current Brightness:** 164.9/255 - Pwedeng pagandahin pa!
         """)
