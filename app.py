@@ -1,86 +1,95 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance
 import io
+from rembg import remove
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="AI ID Photo Generator", layout="centered")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="AI ID Photo Studio", page_icon="📸")
 
-def enhance_image(image):
+def enhance_lighting(image):
     # Convert PIL to OpenCV format
     img_array = np.array(image.convert('RGB'))
     img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
-    # Convert to LAB color space para ma-adjust ang brightness (L channel)
-    # Ito ang technique para lumiwanag pero hindi masira ang mukha
+    # 1. CLAHE for Intelligent Brightness (hindi nasisira ang mukha)
     lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-
-    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     cl = clahe.apply(l)
-
-    # Merge back
     limg = cv2.merge((cl, a, b))
-    final_img = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    enhanced_cv = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
     
-    # Convert back to PIL
-    return Image.fromarray(cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB))
+    # Convert back to PIL for further sharpening
+    enhanced_pil = Image.fromarray(cv2.cvtColor(enhanced_cv, cv2.COLOR_BGR2RGB))
+    
+    # 2. Add a bit of Sharpness para malinaw ang details
+    enhancer = ImageEnhance.Sharpness(enhanced_pil)
+    return enhancer.enhance(1.5)
 
-def resize_image(image, size_type):
-    # Standard sizes at 300 DPI
+def process_id_photo(image, size_type, remove_bg):
+    # Remove Background if selected
+    if remove_bg:
+        image = remove(image)
+        # Create white background
+        new_image = Image.new("RGBA", image.size, "WHITE")
+        new_image.paste(image, (0, 0), image)
+        image = new_image.convert('RGB')
+
+    # Standard sizes (300 DPI)
     sizes = {
-        "2x2 (600x600px)": (600, 600),
-        "1x1 (300x300px)": (300, 300),
-        "Passport Size (413x531px)": (413, 531)
+        "2x2 (600x600 px)": (600, 600),
+        "1x1 (300x300 px)": (300, 300),
+        "Passport Size (413x531 px)": (413, 531)
     }
     
-    target_size = sizes[size_type]
-    
-    # Resize keeping quality (LANCZOS)
-    # Note: Mas maganda kung i-crop muna ito manually ng user, 
-    # pero ito ay automatic scaling para sa prototype.
+    target_size = sizes.get(size_type, (600, 600))
     return image.resize(target_size, Image.Resampling.LANCZOS)
 
-# --- UI DESIGN ---
-st.title("📸 AI ID Photo Generator")
-st.write("I-enhance ang madidilim na picture at i-convert sa standard ID sizes.")
+# --- UI INTERFACE ---
+st.title("📸 AI ID Photo Studio")
+st.markdown("I-transform ang iyong selfie sa isang professional ID photo.")
 
-uploaded_file = st.file_upload("Mag-upload ng iyong picture", type=["jpg", "jpeg", "png"])
+uploaded_file = st.file_uploader("Mag-upload ng iyong picture (JPG/PNG)", type=["jpg", "jpeg", "png"])
 
-if uploaded_file is not None:
-    original_image = Image.open(uploaded_file)
+if uploaded_file:
+    original = Image.open(uploaded_file)
     
-    col1, col2 = st.columns(2)
+    # Sidebar options
+    st.sidebar.header("Settings")
+    size_option = st.sidebar.selectbox("Piliin ang Size:", [
+        "2x2 (600x600 px)", 
+        "1x1 (300x300 px)", 
+        "Passport Size (413x531 px)"
+    ])
     
-    with col1:
-        st.subheader("Original")
-        st.image(original_image, use_container_width=True)
-
-    # Options
-    size_option = st.selectbox("Piliin ang Size:", ["2x2 (600x600px)", "1x1 (300x300px)", "Passport Size (413x531px)"])
+    bg_option = st.sidebar.checkbox("Gawing White Background (AI)", value=True)
     
-    if st.button("Process & Enhance Picture"):
-        with st.spinner("Processing... Ginagawa nating maliwanag ang picture..."):
-            # 1. Enhance Lighting
-            enhanced = enhance_image(original_image)
+    if st.button("Generate ID Photo"):
+        with st.spinner("Processing... Hintayin lang sandali."):
+            # Step 1: Enhance Light & Sharpness
+            brightened = enhance_lighting(original)
             
-            # 2. Resize
-            final_photo = resize_image(enhanced, size_option)
+            # Step 2: Background Removal & Resizing
+            final_result = process_id_photo(brightened, size_option, bg_option)
+            
+            # Display Results
+            col1, col2 = st.columns(2)
+            with col1:
+                st.info("Original Preview")
+                st.image(original, use_container_width=True)
             
             with col2:
-                st.subheader("Enhanced & Resized")
-                st.image(final_photo, use_container_width=True)
+                st.success(f"Enhanced {size_option}")
+                st.image(final_result, use_container_width=True)
                 
                 # Download Button
                 buf = io.BytesIO()
-                final_photo.save(buf, format="JPEG", quality=100)
-                byte_im = buf.getvalue()
-                
+                final_result.save(buf, format="JPEG", quality=95)
                 st.download_button(
-                    label="Download ID Photo",
-                    data=byte_im,
-                    file_name=f"id_photo_{size_option}.jpg",
+                    label="Download Ready-to-Print Photo",
+                    data=buf.getvalue(),
+                    file_name=f"ID_Photo_{size_option.split()[0]}.jpg",
                     mime="image/jpeg"
                 )
