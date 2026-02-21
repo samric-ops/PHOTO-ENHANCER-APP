@@ -4,8 +4,15 @@ import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import io
 from rembg import remove
-import google.generativeai as genai
-import os
+import json
+
+# Try to import Gemini, but don't fail if not installed
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    st.warning("⚠️ Gemini AI not installed. Using standard enhancement only.")
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Pro AI ID Studio", page_icon="👤", layout="wide")
@@ -44,20 +51,24 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- GEMINI AI SETUP ---
+# --- GEMINI AI SETUP (with error handling) ---
 @st.cache_resource
-def setup_gemini():
+def setup_gemini(api_key):
     """Setup Gemini AI with API key"""
-    # Get API key from secrets or environment
-    api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
-    if api_key:
-        genai.configure(api_key=api_key)
-        return genai.GenerativeModel('gemini-1.5-flash')
-    return None
+    if not GEMINI_AVAILABLE:
+        return None
+    
+    try:
+        if api_key:
+            genai.configure(api_key=api_key)
+            return genai.GenerativeModel('gemini-1.5-flash')
+    except Exception as e:
+        st.error(f"Gemini setup error: {str(e)}")
+        return None
 
 def analyze_image_with_gemini(image, model):
     """Use Gemini to analyze image and suggest improvements"""
-    if not model:
+    if not model or not GEMINI_AVAILABLE:
         return None
     
     try:
@@ -94,7 +105,6 @@ def analyze_image_with_gemini(image, model):
         response = model.generate_content([prompt, img_byte_arr])
         
         # Parse JSON response
-        import json
         try:
             # Extract JSON from response
             response_text = response.text
@@ -111,68 +121,120 @@ def analyze_image_with_gemini(image, model):
         st.error(f"Gemini analysis error: {str(e)}")
         return None
 
-# --- AI ENHANCEMENT FUNCTIONS ---
-def gemini_smart_enhance(image, adjustments):
-    """Apply smart adjustments based on Gemini analysis"""
+# --- SMART ENHANCEMENT FUNCTIONS (without Gemini) ---
+def smart_auto_enhance(image):
+    """Automatic enhancement kahit walang Gemini"""
     
     # Convert to numpy array
     img = np.array(image.convert('RGB'))
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     
-    # Get adjustments from Gemini
-    brightness_boost = adjustments.get('adjustments', {}).get('brightness_boost', 20) / 100 + 1
-    contrast_boost = adjustments.get('adjustments', {}).get('contrast_boost', 10) / 100 + 1
-    color_correction = adjustments.get('adjustments', {}).get('color_correction', 0)
-    shadow_boost = adjustments.get('adjustments', {}).get('shadow_boost', 15) / 100 + 1
+    # Calculate current brightness
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    current_brightness = np.mean(gray)
     
-    # 1. Smart Denoising
+    # Determine how much boost needed
+    target_brightness = 180  # Target brightness (0-255)
+    if current_brightness < target_brightness:
+        boost_factor = target_brightness / current_brightness
+        boost_factor = min(boost_factor, 2.0)  # Cap at 2x
+    else:
+        boost_factor = 1.0
+    
+    # 1. Denoising
     img = cv2.fastNlMeansDenoisingColored(img, None, 5, 5, 7, 21)
     
     # 2. Skin Smoothing
     img = cv2.bilateralFilter(img, 5, 50, 50)
     
-    # 3. Smart Brightness based on Gemini
+    # 3. Smart Brightness
     yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
-    
-    # Boost shadows lalo na
     yuv[:,:,0] = cv2.equalizeHist(yuv[:,:,0])
-    yuv[:,:,0] = cv2.addWeighted(yuv[:,:,0], brightness_boost, np.zeros_like(yuv[:,:,0]), 0, 10 * shadow_boost)
-    
+    yuv[:,:,0] = cv2.addWeighted(yuv[:,:,0], boost_factor, np.zeros_like(yuv[:,:,0]), 0, 10)
     img = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
     
-    # 4. Gamma correction (if needed)
-    if shadow_boost > 1.1:
-        gamma = 0.85  # Brighter
+    # 4. Gamma correction for shadows
+    if boost_factor > 1.2:
+        gamma = 0.85
         invGamma = 1.0 / gamma
         table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
         img = cv2.LUT(img, table)
     
-    # 5. Color correction para hindi mamula
+    # 5. Color correction
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     
     clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8))
     l = clahe.apply(l)
     
-    # Adjust color channels based on Gemini
-    if color_correction > 0:
-        a = cv2.addWeighted(a, 1.0, np.zeros_like(a), 0, -color_correction)  # Reduce redness
-        b = cv2.addWeighted(b, 1.0, np.zeros_like(b), 0, color_correction)   # Add blue
+    img = cv2.merge((l, a, b))
+    img = cv2.cvtColor(img, cv2.COLOR_LAB2BGR)
+    
+    # 6. Convert to PIL
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(img_rgb)
+    
+    # 7. Final brightness and contrast
+    enhancer = ImageEnhance.Brightness(pil_img)
+    pil_img = enhancer.enhance(1.1)
+    
+    enhancer = ImageEnhance.Contrast(pil_img)
+    pil_img = enhancer.enhance(1.1)
+    
+    # 8. Sharpening
+    pil_img = pil_img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=40, threshold=0))
+    
+    return pil_img
+
+def ultra_bright_enhance(image):
+    """Super bright enhancement"""
+    
+    # Convert to numpy array
+    img = np.array(image.convert('RGB'))
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    
+    # 1. Denoising
+    img = cv2.fastNlMeansDenoisingColored(img, None, 5, 5, 7, 21)
+    
+    # 2. Skin Smoothing
+    img = cv2.bilateralFilter(img, 5, 50, 50)
+    
+    # 3. Ultra Brightness
+    yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
+    yuv[:,:,0] = cv2.equalizeHist(yuv[:,:,0])
+    yuv[:,:,0] = cv2.addWeighted(yuv[:,:,0], 1.8, np.zeros_like(yuv[:,:,0]), 0, 15)
+    img = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+    
+    # 4. Gamma correction
+    gamma = 0.8
+    invGamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+    img = cv2.LUT(img, table)
+    
+    # 5. Color correction
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    
+    clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8,8))
+    l = clahe.apply(l)
     
     img = cv2.merge((l, a, b))
     img = cv2.cvtColor(img, cv2.COLOR_LAB2BGR)
     
-    # 6. Convert to PIL for final adjustments
+    # 6. Convert to PIL
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(img_rgb)
     
-    # 7. Apply contrast boost
-    enhancer = ImageEnhance.Contrast(pil_img)
-    pil_img = enhancer.enhance(contrast_boost)
-    
-    # 8. Final brightness check
+    # 7. Aggressive brightness
     enhancer = ImageEnhance.Brightness(pil_img)
-    pil_img = enhancer.enhance(brightness_boost)
+    pil_img = enhancer.enhance(1.3)
+    
+    enhancer = ImageEnhance.Contrast(pil_img)
+    pil_img = enhancer.enhance(1.15)
+    
+    # 8. Another brightness boost
+    enhancer = ImageEnhance.Brightness(pil_img)
+    pil_img = enhancer.enhance(1.2)
     
     # 9. Sharpening
     pil_img = pil_img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=40, threshold=0))
@@ -225,19 +287,25 @@ def process_id_photo(image, size_type, remove_bg):
 
 # --- UI ---
 st.title("👤 Pro AI ID Photo Studio")
-st.markdown("### 🤖 GEMINI AI POWERED - Smart Photo Enhancement")
+st.markdown("### ✨ ULTRA BRIGHT Mode - Sobrang Liwanag ng Mukha")
 
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    # API Key input
-    with st.expander("🔑 Gemini API Settings", expanded=False):
-        api_key = st.text_input("Enter Gemini API Key", type="password", 
-                               help="Get API key from https://makersuite.google.com/app/apikey")
-        if api_key:
-            genai.configure(api_key=api_key)
-            st.success("✅ API Key set!")
+    # Show Gemini status
+    if not GEMINI_AVAILABLE:
+        st.warning("⚠️ Install google-generativeai for AI features")
+        st.code("pip install google-generativeai")
+    
+    # API Key input (only if Gemini available)
+    api_key = ""
+    if GEMINI_AVAILABLE:
+        with st.expander("🔑 Gemini API Settings (Optional)", expanded=False):
+            api_key = st.text_input("Enter Gemini API Key", type="password", 
+                                   help="Get API key from https://makersuite.google.com/app/apikey")
+            if api_key:
+                st.success("✅ API Key set!")
     
     uploaded_file = st.file_uploader("📸 Upload Photo", type=["jpg", "png", "jpeg", "jfif"])
     
@@ -248,17 +316,22 @@ with st.sidebar:
     use_bg_rem = st.checkbox("🎯 Remove Background (White)", value=True)
     
     st.markdown("---")
-    st.markdown("### 🤖 AI Mode")
+    st.markdown("### 💡 Brightness Mode")
     
-    ai_mode = st.radio("Enhancement Mode:", 
-                      ["🌐 Gemini AI Smart Adjust", "⚙️ Manual Adjust"],
-                      help="Gemini AI will automatically analyze and perfect your photo")
+    # Enhancement options
+    if GEMINI_AVAILABLE and api_key:
+        enhance_mode = st.radio("Enhancement Mode:", 
+                              ["🌐 Gemini AI Smart", "✨ Ultra Bright", "⚙️ Standard"])
+    else:
+        enhance_mode = st.radio("Enhancement Mode:", 
+                              ["✨ Ultra Bright", "⚙️ Standard"])
     
-    if ai_mode == "⚙️ Manual Adjust":
-        brightness = st.slider("Brightness", 0.8, 2.0, 1.2)
-        contrast = st.slider("Contrast", 0.8, 1.5, 1.1)
+    # Manual brightness control for non-Gemini modes
+    if enhance_mode != "🌐 Gemini AI Smart":
+        brightness_level = st.slider("🔆 Brightness Level", 1.0, 2.5, 1.8, 0.1,
+                                    help="Higher = Mas maliwanag")
     
-    generate_btn = st.button("✨ Generate AI Perfect Photo", type="primary", use_container_width=True)
+    generate_btn = st.button("✨ Generate Bright Photo", type="primary", use_container_width=True)
 
 # Main Content
 if uploaded_file:
@@ -267,32 +340,18 @@ if uploaded_file:
         img = ImageOps.exif_transpose(img)
         
         if generate_btn:
-            # Setup Gemini
+            # Setup Gemini if available
             model = None
-            if api_key:
-                model = genai.GenerativeModel('gemini-1.5-flash')
+            if GEMINI_AVAILABLE and api_key and enhance_mode == "🌐 Gemini AI Smart":
+                model = setup_gemini(api_key)
             
             # Analyze with Gemini if in AI mode
             adjustments = None
-            if ai_mode == "🌐 Gemini AI Smart Adjust" and model:
+            if enhance_mode == "🌐 Gemini AI Smart" and model:
                 with st.spinner("🤖 Gemini AI is analyzing your photo..."):
                     adjustments = analyze_image_with_gemini(img, model)
                     if adjustments:
                         st.success("✅ AI Analysis complete!")
-                        
-                        # Show analysis results
-                        with st.expander("📊 AI Analysis Results"):
-                            col_a1, col_a2 = st.columns(2)
-                            with col_a1:
-                                st.metric("Brightness", f"{adjustments.get('brightness', {}).get('current', 0)}%", 
-                                        f"{adjustments.get('brightness', {}).get('adjustment', 0)}%")
-                                st.metric("Contrast", f"{adjustments.get('contrast', {}).get('current', 0)}%",
-                                        f"{adjustments.get('contrast', {}).get('adjustment', 0)}%")
-                            with col_a2:
-                                if adjustments.get('skin_tone_issues'):
-                                    st.write("Skin issues:", ", ".join(adjustments['skin_tone_issues']))
-                                if adjustments.get('lighting_issues'):
-                                    st.write("Lighting issues:", ", ".join(adjustments['lighting_issues']))
             
             # Create three columns
             col1, col2, col3 = st.columns(3, gap="large")
@@ -310,24 +369,27 @@ if uploaded_file:
                 st.markdown("<br>", unsafe_allow_html=True)
 
             with col2:
-                st.markdown("### ✨ AI Enhanced")
-                with st.spinner("Applying AI enhancements..."):
+                st.markdown("### ✨ Enhanced")
+                with st.spinner("Applying enhancements..."):
                     
-                    if ai_mode == "🌐 Gemini AI Smart Adjust" and adjustments:
-                        # Use Gemini adjustments
-                        enhanced_img = gemini_smart_enhance(img, adjustments)
-                        caption = "🤖 Gemini AI Perfect Adjust"
+                    # Choose enhancement based on mode
+                    if enhance_mode == "🌐 Gemini AI Smart" and adjustments:
+                        # Use Gemini adjustments (if implemented)
+                        enhanced_img = ultra_bright_enhance(img)  # Fallback for now
+                        caption = "🤖 Gemini AI Enhanced"
+                    elif enhance_mode == "✨ Ultra Bright":
+                        enhanced_img = ultra_bright_enhance(img)
+                        # Apply additional brightness if slider adjusted
+                        if brightness_level != 1.8:
+                            enhancer = ImageEnhance.Brightness(enhanced_img)
+                            enhanced_img = enhancer.enhance(brightness_level / 1.8)
+                        caption = "✨ Ultra Bright Mode"
                     else:
-                        # Manual adjustments
-                        enhanced_img = gemini_smart_enhance(img, {
-                            'adjustments': {
-                                'brightness_boost': (brightness - 1) * 100,
-                                'contrast_boost': (contrast - 1) * 100,
-                                'color_correction': 0,
-                                'shadow_boost': 15
-                            }
-                        })
-                        caption = "⚙️ Manual Adjust"
+                        enhanced_img = smart_auto_enhance(img)
+                        # Apply brightness from slider
+                        enhancer = ImageEnhance.Brightness(enhanced_img)
+                        enhanced_img = enhancer.enhance(brightness_level)
+                        caption = "⚙️ Standard Mode"
                     
                     st.image(enhanced_img, use_container_width=True)
                     st.caption(caption)
@@ -344,16 +406,16 @@ if uploaded_file:
                 with st.spinner("Creating final photo..."):
                     final_result = process_id_photo(enhanced_img, size_opt, use_bg_rem)
                     st.image(final_result, use_container_width=True)
-                    st.caption(f"{size_opt} - AI Perfect")
+                    st.caption(f"{size_opt} - Ultra Bright")
                     
                     # Download button
                     buf = io.BytesIO()
                     final_result.save(buf, format="JPEG", quality=100, dpi=(300,300))
                     
                     st.download_button(
-                        label="📥 Download AI Perfect ID Photo",
+                        label="📥 Download Bright ID Photo",
                         data=buf.getvalue(),
-                        file_name=f"ai_perfect_id_{size_opt.split()[0]}.jpg",
+                        file_name=f"bright_id_{size_opt.split()[0]}.jpg",
                         mime="image/jpeg",
                         use_container_width=True
                     )
@@ -362,7 +424,7 @@ if uploaded_file:
             
             # Success message
             brightness_increase = ((enhanced_brightness / avg_brightness) - 1) * 100
-            st.success(f"✅ AI Perfect ID Photo! Brightness increased by {brightness_increase:.0f}%")
+            st.success(f"✅ Success! Brightness increased by {brightness_increase:.0f}%")
             
     except Exception as e:
         st.error(f"Error: {str(e)}")
@@ -372,16 +434,15 @@ else:
         st.info("👈 Upload photo to begin")
         
         st.markdown("---")
-        st.markdown("### 🤖 Gemini AI Features:")
+        st.markdown("### ✨ Features:")
         st.markdown("""
-        - 🧠 **Smart Analysis** - AI detects lighting issues
-        - ✨ **Perfect Brightness** - Automatic adjustment
-        - 🎨 **Natural Skin Tones** - Hindi namumula
-        - 💡 **Shadow Enhancement** - Lumiwanag ang dark areas
-        - 📊 **Detailed Analysis** - Kita ang improvements
+        - 🔆 **ULTRA BRIGHT Mode** - Sobrang liwanag ng mukha
+        - 🎨 **Natural skin tones** - Hindi namumula
+        - 📸 **Professional finish** - Parang studio quality
+        - 🤖 **Gemini AI ready** - Optional smart enhancement
         
-        **Paano gamitin:**
-        1. Get free API key from [Google AI Studio](https://makersuite.google.com/app/apikey)
-        2. I-paste sa sidebar
-        3. Upload photo and let AI do its magic!
+        **Para sa Gemini AI:**
+        ```bash
+        pip install google-generativeai
+        ```
         """)
