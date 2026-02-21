@@ -11,7 +11,6 @@ st.set_page_config(page_title="Pro AI ID Studio", page_icon="👤", layout="wide
 # --- CUSTOM CSS PARA SA MAAYOS NA LAYOUT ---
 st.markdown("""
 <style>
-    /* Fix para sa overlapping text */
     .stImage {
         margin-bottom: 10px;
     }
@@ -22,16 +21,13 @@ st.markdown("""
         width: 100%;
         margin-top: 10px;
     }
-    /* Spacing sa columns */
     .css-1r6slb0 {
         gap: 20px;
     }
-    /* Caption styling */
     .css-183lzff {
         margin-bottom: 15px;
         text-align: center;
     }
-    /* Divider styling */
     hr {
         margin: 20px 0 !important;
     }
@@ -40,46 +36,50 @@ st.markdown("""
 
 # --- PROFESSIONAL ENHANCEMENT FUNCTIONS ---
 def professional_face_enhance(image):
-    """Professional enhancement para magmukhang studio quality"""
+    """Professional enhancement na hindi namumula ang mukha"""
     # Convert PIL to OpenCV
     img = np.array(image.convert('RGB'))
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     
-    # 1. Advanced Denoising
-    img = cv2.fastNlMeansDenoisingColored(img, None, 8, 8, 7, 21)
+    # 1. Light Denoising (mas light para hindi magmukhang plastic)
+    img = cv2.fastNlMeansDenoisingColored(img, None, 5, 5, 7, 21)
     
-    # 2. Skin Smoothing
-    img = cv2.bilateralFilter(img, 9, 75, 75)
+    # 2. Skin Smoothing (very subtle)
+    img = cv2.bilateralFilter(img, 5, 50, 50)
     
-    # 3. Smart Contrast Enhancement
+    # 3. Color Correction - FIX PARA HINDI MAPULA
+    # Convert to LAB for better color handling
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+    # Light CLAHE lang (para hindi mag-over contrast)
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8))
     l = clahe.apply(l)
     
-    a = cv2.equalizeHist(a)
-    b = cv2.equalizeHist(b)
+    # Balance ang a at b channels (para hindi mamula)
+    a = cv2.addWeighted(a, 1.0, np.zeros_like(a), 0, 0)  # No change sa a channel (red-green)
+    b = cv2.addWeighted(b, 1.0, np.zeros_like(b), 0, 0)  # No change sa b channel (blue-yellow)
     
     img = cv2.merge((l, a, b))
     img = cv2.cvtColor(img, cv2.COLOR_LAB2BGR)
     
-    # 4. Color Balance
+    # 4. White Balance Correction
+    # Para hindi masyadong warm (yellow/red) ang dating
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(img)
     
-    # 5. Professional Adjustments
+    # 5. Gentle Adjustments (minimal lang)
     enhancer = ImageEnhance.Brightness(pil_img)
-    pil_img = enhancer.enhance(1.05)
+    pil_img = enhancer.enhance(1.02)  # Very slight brightness
     
     enhancer = ImageEnhance.Contrast(pil_img)
-    pil_img = enhancer.enhance(1.1)
+    pil_img = enhancer.enhance(1.05)   # Slight contrast
     
     enhancer = ImageEnhance.Color(pil_img)
-    pil_img = enhancer.enhance(1.15)
+    pil_img = enhancer.enhance(1.0)    # NO color enhancement (para hindi mamula)
     
-    # 6. Professional Sharpening
-    pil_img = pil_img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=50, threshold=0))
+    # 6. Very subtle sharpening
+    pil_img = pil_img.filter(ImageFilter.UnsharpMask(radius=0.3, percent=30, threshold=1))
     
     return pil_img
 
@@ -129,26 +129,27 @@ def process_id_photo(image, size_type, remove_bg):
 
 # --- UI ---
 st.title("👤 Pro AI ID Photo Studio")
-st.markdown("### Professional ID Photo Generator - Parang Remini ang Quality")
+st.markdown("### Professional ID Photo Generator - Natural Skin Tones")
 
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Settings")
-    uploaded_file = st.file_uploader("📸 Upload Photo (Half body is best)", type=["jpg", "png", "jpeg", "jfif"])
+    uploaded_file = st.file_uploader("📸 Upload Photo", type=["jpg", "png", "jpeg", "jfif"])
     
     size_opt = st.selectbox("📏 Select Output Size:", 
                            ["2x2 (600x600 px)", "1x1 (300x300 px)", 
                             "Passport (413x531 px)", "PRC Size (531x531 px)"])
     
-    use_bg_rem = st.checkbox("🎯 Remove Background (White Background)", value=True)
+    use_bg_rem = st.checkbox("🎯 Remove Background (White)", value=True)
     
     st.markdown("---")
-    st.markdown("### 🎨 Enhancement Options")
+    st.markdown("### 🎨 Color Settings")
     
-    smooth_skin = st.checkbox("✨ Skin Smoothing", value=True)
-    enhance_details = st.checkbox("🔍 Enhance Details", value=True)
+    # Add color temperature control
+    color_temp = st.slider("🌡️ Color Temperature", -10, 10, 0, 
+                          help="Adjust kung gusto mo ng mas cool (-) o warm (+) na skin tone")
     
-    generate_btn = st.button("🎨 Generate Professional ID Photo", type="primary", use_container_width=True)
+    generate_btn = st.button("🎨 Generate ID Photo", type="primary", use_container_width=True)
 
 # Main Content
 if uploaded_file:
@@ -157,62 +158,63 @@ if uploaded_file:
         img = ImageOps.exif_transpose(img)
         
         if generate_btn:
-            # Create three columns with proper spacing
+            # Create three columns
             col1, col2, col3 = st.columns(3, gap="large")
             
             with col1:
                 st.markdown("### 📷 Original")
                 st.image(img, use_container_width=True)
-                st.caption(f"Original size: {img.size[0]}x{img.size[1]} px")
-                st.markdown("<br>", unsafe_allow_html=True)  # Add spacing
+                st.caption(f"Size: {img.size[0]}x{img.size[1]} px")
+                st.markdown("<br>", unsafe_allow_html=True)
 
             with col2:
-                st.markdown("### ✨ AI Enhanced")
-                with st.spinner("Applying professional enhancements..."):
+                st.markdown("### ✨ Enhanced")
+                with st.spinner("Enhancing..."):
                     enhanced_img = professional_face_enhance(img)
+                    
+                    # Apply color temperature adjustment kung may slider
+                    if color_temp != 0:
+                        # Convert to numpy for color adjustment
+                        enhanced_np = np.array(enhanced_img)
+                        
+                        if color_temp > 0:  # Warmer (less red)
+                            enhanced_np[:,:,0] = np.clip(enhanced_np[:,:,0] * (1 - color_temp/100), 0, 255).astype(np.uint8)
+                            enhanced_np[:,:,2] = np.clip(enhanced_np[:,:,2] * (1 + color_temp/100), 0, 255).astype(np.uint8)
+                        else:  # Cooler
+                            enhanced_np[:,:,0] = np.clip(enhanced_np[:,:,0] * (1 + abs(color_temp)/100), 0, 255).astype(np.uint8)
+                            enhanced_np[:,:,2] = np.clip(enhanced_np[:,:,2] * (1 - abs(color_temp)/100), 0, 255).astype(np.uint8)
+                        
+                        enhanced_img = Image.fromarray(enhanced_np)
+                    
                     st.image(enhanced_img, use_container_width=True)
-                    st.caption("After AI Enhancement")
+                    st.caption("Natural Skin Tones")
                     st.markdown("<br>", unsafe_allow_html=True)
 
             with col3:
-                st.markdown("### 🎯 Final ID Photo")
-                with st.spinner("Creating final ID photo..."):
+                st.markdown("### 🎯 Final ID")
+                with st.spinner("Finalizing..."):
                     final_result = process_id_photo(enhanced_img, size_opt, use_bg_rem)
                     st.image(final_result, use_container_width=True)
-                    st.caption(f"Final: {size_opt}")
+                    st.caption(f"{size_opt}")
                     
-                    # Download button sa ilalim ng image
+                    # Download button
                     buf = io.BytesIO()
                     final_result.save(buf, format="JPEG", quality=100, dpi=(300,300))
                     
                     st.download_button(
-                        label="📥 Download Professional ID Photo",
+                        label="📥 Download Photo",
                         data=buf.getvalue(),
-                        file_name=f"professional_id_{size_opt.split()[0]}.jpg",
+                        file_name=f"id_photo_{size_opt.split()[0]}.jpg",
                         mime="image/jpeg",
                         use_container_width=True
                     )
             
-            # Success message sa baba ng columns
             st.markdown("---")
-            st.success("✅ Professional ID photo generated successfully! Ready for printing.")
+            st.success("✅ ID Photo generated with natural skin tones!")
             
     except Exception as e:
-        st.error(f"Error processing image: {str(e)}")
+        st.error(f"Error: {str(e)}")
 else:
-    # Welcome screen
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        st.info("👈 Please upload a photo in the sidebar to begin.")
-        
-        st.markdown("---")
-        st.markdown("### Sample Professional Result:")
-        
-        # Sample images placeholder
-        sample_col1, sample_col2, sample_col3 = st.columns(3)
-        with sample_col1:
-            st.image("https://via.placeholder.com/200x250/ffffff/000000?text=Original", caption="Before")
-        with sample_col2:
-            st.image("https://via.placeholder.com/200x250/f0f0f0/000000?text=Enhanced", caption="AI Enhanced")
-        with sample_col3:
-            st.image("https://via.placeholder.com/200x250/ffffff/000000?text=Final+ID", caption="Final ID")
+        st.info("👈 Upload photo to begin")
