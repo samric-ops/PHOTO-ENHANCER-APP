@@ -121,25 +121,13 @@ def analyze_image_with_gemini(image, model):
         st.error(f"Gemini analysis error: {str(e)}")
         return None
 
-# --- SMART ENHANCEMENT FUNCTIONS (without Gemini) ---
-def smart_auto_enhance(image):
-    """Automatic enhancement kahit walang Gemini"""
+# --- SMART ENHANCEMENT FUNCTIONS ---
+def smart_auto_enhance(image, brightness=1.2):
+    """Automatic enhancement with adjustable brightness"""
     
     # Convert to numpy array
     img = np.array(image.convert('RGB'))
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    
-    # Calculate current brightness
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    current_brightness = np.mean(gray)
-    
-    # Determine how much boost needed
-    target_brightness = 180  # Target brightness (0-255)
-    if current_brightness < target_brightness:
-        boost_factor = target_brightness / current_brightness
-        boost_factor = min(boost_factor, 2.0)  # Cap at 2x
-    else:
-        boost_factor = 1.0
     
     # 1. Denoising
     img = cv2.fastNlMeansDenoisingColored(img, None, 5, 5, 7, 21)
@@ -150,11 +138,11 @@ def smart_auto_enhance(image):
     # 3. Smart Brightness
     yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
     yuv[:,:,0] = cv2.equalizeHist(yuv[:,:,0])
-    yuv[:,:,0] = cv2.addWeighted(yuv[:,:,0], boost_factor, np.zeros_like(yuv[:,:,0]), 0, 10)
+    yuv[:,:,0] = cv2.addWeighted(yuv[:,:,0], brightness, np.zeros_like(yuv[:,:,0]), 0, 10)
     img = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
     
     # 4. Gamma correction for shadows
-    if boost_factor > 1.2:
+    if brightness > 1.2:
         gamma = 0.85
         invGamma = 1.0 / gamma
         table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
@@ -174,10 +162,7 @@ def smart_auto_enhance(image):
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(img_rgb)
     
-    # 7. Final brightness and contrast
-    enhancer = ImageEnhance.Brightness(pil_img)
-    pil_img = enhancer.enhance(1.1)
-    
+    # 7. Final adjustments
     enhancer = ImageEnhance.Contrast(pil_img)
     pil_img = enhancer.enhance(1.1)
     
@@ -186,8 +171,8 @@ def smart_auto_enhance(image):
     
     return pil_img
 
-def ultra_bright_enhance(image):
-    """Super bright enhancement"""
+def ultra_bright_enhance(image, brightness_multiplier=1.8):
+    """Super bright enhancement with adjustable brightness"""
     
     # Convert to numpy array
     img = np.array(image.convert('RGB'))
@@ -202,7 +187,7 @@ def ultra_bright_enhance(image):
     # 3. Ultra Brightness
     yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
     yuv[:,:,0] = cv2.equalizeHist(yuv[:,:,0])
-    yuv[:,:,0] = cv2.addWeighted(yuv[:,:,0], 1.8, np.zeros_like(yuv[:,:,0]), 0, 15)
+    yuv[:,:,0] = cv2.addWeighted(yuv[:,:,0], brightness_multiplier, np.zeros_like(yuv[:,:,0]), 0, 15)
     img = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
     
     # 4. Gamma correction
@@ -321,15 +306,22 @@ with st.sidebar:
     # Enhancement options
     if GEMINI_AVAILABLE and api_key:
         enhance_mode = st.radio("Enhancement Mode:", 
-                              ["🌐 Gemini AI Smart", "✨ Ultra Bright", "⚙️ Standard"])
+                              ["🌐 Gemini AI Smart", "✨ Ultra Bright", "⚙️ Standard"],
+                              index=1)  # Default to Ultra Bright
     else:
         enhance_mode = st.radio("Enhancement Mode:", 
-                              ["✨ Ultra Bright", "⚙️ Standard"])
+                              ["✨ Ultra Bright", "⚙️ Standard"],
+                              index=0)  # Default to Ultra Bright
     
-    # Manual brightness control for non-Gemini modes
-    if enhance_mode != "🌐 Gemini AI Smart":
-        brightness_level = st.slider("🔆 Brightness Level", 1.0, 2.5, 1.8, 0.1,
+    # Brightness control - defined for ALL modes except Gemini
+    brightness_level = 1.8  # Default value
+    
+    if enhance_mode == "✨ Ultra Bright":
+        brightness_level = st.slider("🔆 Ultra Bright Level", 1.0, 2.5, 1.8, 0.1,
                                     help="Higher = Mas maliwanag")
+    elif enhance_mode == "⚙️ Standard":
+        brightness_level = st.slider("🔆 Brightness Level", 1.0, 2.0, 1.2, 0.1,
+                                    help="Adjust brightness level")
     
     generate_btn = st.button("✨ Generate Bright Photo", type="primary", use_container_width=True)
 
@@ -375,21 +367,14 @@ if uploaded_file:
                     # Choose enhancement based on mode
                     if enhance_mode == "🌐 Gemini AI Smart" and adjustments:
                         # Use Gemini adjustments (if implemented)
-                        enhanced_img = ultra_bright_enhance(img)  # Fallback for now
+                        enhanced_img = ultra_bright_enhance(img, 1.8)  # Fallback
                         caption = "🤖 Gemini AI Enhanced"
                     elif enhance_mode == "✨ Ultra Bright":
-                        enhanced_img = ultra_bright_enhance(img)
-                        # Apply additional brightness if slider adjusted
-                        if brightness_level != 1.8:
-                            enhancer = ImageEnhance.Brightness(enhanced_img)
-                            enhanced_img = enhancer.enhance(brightness_level / 1.8)
-                        caption = "✨ Ultra Bright Mode"
-                    else:
-                        enhanced_img = smart_auto_enhance(img)
-                        # Apply brightness from slider
-                        enhancer = ImageEnhance.Brightness(enhanced_img)
-                        enhanced_img = enhancer.enhance(brightness_level)
-                        caption = "⚙️ Standard Mode"
+                        enhanced_img = ultra_bright_enhance(img, brightness_level)
+                        caption = f"✨ Ultra Bright ({brightness_level}x)"
+                    else:  # Standard mode
+                        enhanced_img = smart_auto_enhance(img, brightness_level)
+                        caption = f"⚙️ Standard Mode ({brightness_level}x)"
                     
                     st.image(enhanced_img, use_container_width=True)
                     st.caption(caption)
@@ -406,7 +391,7 @@ if uploaded_file:
                 with st.spinner("Creating final photo..."):
                     final_result = process_id_photo(enhanced_img, size_opt, use_bg_rem)
                     st.image(final_result, use_container_width=True)
-                    st.caption(f"{size_opt} - Ultra Bright")
+                    st.caption(f"{size_opt}")
                     
                     # Download button
                     buf = io.BytesIO()
@@ -426,8 +411,12 @@ if uploaded_file:
             brightness_increase = ((enhanced_brightness / avg_brightness) - 1) * 100
             st.success(f"✅ Success! Brightness increased by {brightness_increase:.0f}%")
             
+            # Show what mode was used
+            st.info(f"Used: {caption}")
+            
     except Exception as e:
         st.error(f"Error: {str(e)}")
+        st.exception(e)  # Show full error for debugging
 else:
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
@@ -436,13 +425,11 @@ else:
         st.markdown("---")
         st.markdown("### ✨ Features:")
         st.markdown("""
-        - 🔆 **ULTRA BRIGHT Mode** - Sobrang liwanag ng mukha
+        - 🔆 **ULTRA BRIGHT Mode** - Sobrang liwanag ng mukha (1.0x to 2.5x)
+        - ⚙️ **Standard Mode** - Natural na liwanag (1.0x to 2.0x)
         - 🎨 **Natural skin tones** - Hindi namumula
         - 📸 **Professional finish** - Parang studio quality
         - 🤖 **Gemini AI ready** - Optional smart enhancement
         
-        **Para sa Gemini AI:**
-        ```bash
-        pip install google-generativeai
-        ```
+        **Current Brightness:** 164.9/255 - Pwedeng pagandahin pa!
         """)
