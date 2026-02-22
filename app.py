@@ -1,14 +1,14 @@
-# AI Portrait Cleaner — ID-Style
-# Fresh build: clean white/near-white/blue background, natural bright tone, centered crop, crisp details.
-# No Gemini required. Uses rembg for precise cut-out + edge feather + tuned relight pipeline.
+# Natural ID-Style Portrait Cleaner
+# Focus: natural light (no green tint), minimized shadows, clean background (white/near-white/blue),
+#        centered 3:4 head-and-shoulders framing. 100% local processing (no API keys).
 
 import streamlit as st
 import io
-from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 import numpy as np
 import cv2
 
-# Optional background removal
+# Optional background removal (best edges)
 try:
     from rembg import remove as rembg_remove
     HAS_REMBG = True
@@ -16,48 +16,35 @@ except Exception:
     HAS_REMBG = False
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PAGE CONFIG
+# APP CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="ID-Style Portrait Cleaner", page_icon="🪪", layout="wide")
+st.set_page_config(page_title="Natural ID-Style Portrait", page_icon="🪪", layout="wide")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# EXPORT HELPERS
+# SAVE / EXPORT HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 def save_jpeg_bytes(pil_img, quality=95, subsampling="4:4:4"):
-    """
-    High-quality JPEG export with 4:4:4 subsampling to keep skin gradients smooth.
-    """
     buf = io.BytesIO()
     pil_img = pil_img.convert("RGB")
-    subsampling_map = {"4:4:4": 0, "4:2:2": 1, "4:2:0": 2}
-    ss = subsampling_map.get(subsampling, 0)
-    pil_img.save(buf, format="JPEG", quality=quality, subsampling=ss, optimize=True)
+    ss_map = {"4:4:4": 0, "4:2:2": 1, "4:2:0": 2}
+    pil_img.save(buf, format="JPEG", quality=quality, subsampling=ss_map.get(subsampling, 0), optimize=True)
     return buf.getvalue()
 
 def mm_to_pixels(mm, dpi=300):
-    inches = float(mm) / 25.4
-    return int(round(inches * dpi))
+    return int(round((mm / 25.4) * dpi))
 
-def place_on_canvas(pil_img, target_mm=(35, 45), dpi=300, bg=(255, 255, 255)):
-    """
-    Center the image on an exact-size canvas (e.g., 35x45 mm) at chosen DPI.
-    Keeps small margin around subject for clean print.
-    """
-    tw = mm_to_pixels(target_mm[0], dpi)
-    th = mm_to_pixels(target_mm[1], dpi)
+def place_on_canvas(img: Image.Image, target_mm=(35,45), dpi=300, bg=(255,255,255), margin_px=12):
+    tw, th = mm_to_pixels(target_mm[0], dpi), mm_to_pixels(target_mm[1], dpi)
     canvas = Image.new("RGB", (tw, th), bg)
-    iw, ih = pil_img.size
-    # Fit inside with a small border
-    scale = min((tw - 12) / iw, (th - 12) / ih)
-    nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
-    resized = pil_img.resize((nw, nh), Image.LANCZOS)
-    x = (tw - nw) // 2
-    y = (th - nh) // 2
-    canvas.paste(resized, (x, y))
+    iw, ih = img.size
+    scale = min((tw - margin_px*2) / iw, (th - margin_px*2) / ih)
+    nw, nh = max(1, int(iw*scale)), max(1, int(ih*scale))
+    resized = img.resize((nw, nh), Image.LANCZOS)
+    canvas.paste(resized, ((tw - nw)//2, (th - nh)//2))
     return canvas
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FACE & FRAMING
+# FACE & FRAMING (3:4 crop)
 # ──────────────────────────────────────────────────────────────────────────────
 def detect_faces_bboxes(pil_img):
     img = np.array(pil_img.convert("RGB"))
@@ -67,30 +54,23 @@ def detect_faces_bboxes(pil_img):
     return faces
 
 def face_focus_crop(pil_img, target_aspect=3/4, pad=0.22):
-    """
-    Crop to a portrait-friendly 3:4 aspect around the largest face,
-    with margins that keep hairline and shoulders for an ID look.
-    """
+    """Crop to 3:4 around largest face with generous head-and-shoulders margin."""
     w, h = pil_img.size
     faces = detect_faces_bboxes(pil_img)
     if len(faces) == 0:
-        # No face detected → return original (user can crop manually if needed)
         return pil_img
 
-    # largest face
-    (x, y, fw, fh) = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[0]
-    cx, cy = x + fw / 2, y + fh / 2
+    (x, y, fw, fh) = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
+    cx, cy = x + fw/2, y + fh/2
 
-    # Box height with padding; width from aspect; ensure shoulders margin
-    box_h = fh * (1 + pad * 3.2)
-    box_w = max(fw * (1 + pad * 2.4), box_h * target_aspect)
+    box_h = fh * (1 + pad*3.0)
+    box_w = max(fw * (1 + pad*2.2), box_h * target_aspect)
 
-    left = int(max(0, cx - box_w / 2))
-    top = int(max(0, cy - fh * 0.70))       # slightly higher to include more shoulder
+    left = int(max(0, cx - box_w/2))
+    top  = int(max(0, cy - fh*0.70))
     right = int(min(w, left + box_w))
     bottom = int(min(h, top + box_h))
 
-    # Enforce 3:4 exact
     cw, ch = right - left, bottom - top
     cur_aspect = cw / max(1, ch)
     if cur_aspect > target_aspect:
@@ -104,173 +84,201 @@ def face_focus_crop(pil_img, target_aspect=3/4, pad=0.22):
         top += dy
         bottom = top + new_h
 
-    left, top, right, bottom = map(int, [max(0, left), max(0, top), min(w, right), min(h, bottom)])
+    left, top, right, bottom = map(int, [max(0,left), max(0,top), min(w,right), min(h,bottom)])
     return pil_img.crop((left, top, right, bottom))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TONE / RELIGHT PIPELINE (natural brightness, clean color, crisp details)
+# COLOR / LIGHTING — natural look, anti-green, shadow softening
 # ──────────────────────────────────────────────────────────────────────────────
-def auto_white_balance_bgr(img_bgr):
-    """
-    Gray-world white balance for natural color; robust and fast.
-    """
-    result = img_bgr.astype(np.float32)
-    b, g, r = result[:,:,0], result[:,:,1], result[:,:,2]
-    avg_b, avg_g, avg_r = b.mean(), g.mean(), r.mean()
-    avg_gray = (avg_b + avg_g + avg_r) / 3.0
+def shades_of_gray_wb_bgr(img_bgr, p=6):
+    """Shades-of-Gray white balance (p-norm) — mas natural kaysa pure gray-world."""
+    img = img_bgr.astype(np.float32)
     eps = 1e-6
-    result[:,:,0] *= avg_gray / (avg_b + eps)
-    result[:,:,1] *= avg_gray / (avg_g + eps)
-    result[:,:,2] *= avg_gray / (avg_r + eps)
-    return np.clip(result, 0, 255).astype(np.uint8)
+    r = np.power(img[:,:,2], p).mean() ** (1.0/p)
+    g = np.power(img[:,:,1], p).mean() ** (1.0/p)
+    b = np.power(img[:,:,0], p).mean() ** (1.0/p)
+    avg = (r + g + b) / 3.0
+    img[:,:,2] *= (avg / (r + eps))
+    img[:,:,1] *= (avg / (g + eps))
+    img[:,:,0] *= (avg / (b + eps))
+    return np.clip(img, 0, 255).astype(np.uint8)
 
-def lift_shadows_preserve_highlights_bgr(img_bgr, strength=0.34):
+def neutralize_tint_lab(img_bgr, limit=6):
     """
-    Lift shadowed regions more than highlights via an S-curve in Lab L channel.
+    Neutralize green/yellow/magenta/blue casts by centering LAB A/B medians towards 128,
+    but clamp to ±limit units to keep it NATURAL (no overcooling).
     """
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
-    Lf = L.astype(np.float32) / 255.0
-    lifted = Lf + strength * (1 - np.exp(-3.0 * Lf))
-    L_out = (np.clip(lifted, 0, 1) * 255).astype(np.uint8)
-    return cv2.cvtColor(cv2.merge([L_out, A, B]), cv2.COLOR_LAB2BGR)
 
-def local_contrast_bgr(img_bgr, clip_limit=1.9, tiles=(8,8)):
+    mA = float(np.median(A)); mB = float(np.median(B))
+    dA = int(np.clip(round(mA - 128), -limit, limit))
+    dB = int(np.clip(round(mB - 128), -limit, limit))
+
+    if dA != 0:
+        # subtract bias safely (avoid uint8 underflow)
+        A = cv2.subtract(A, np.full_like(A, dA, dtype=np.uint8))
+    if dB != 0:
+        B = cv2.subtract(B, np.full_like(B, dB, dtype=np.uint8))
+
+    return cv2.cvtColor(cv2.merge([L, A, B]), cv2.COLOR_LAB2BGR)
+
+def retinex_msr_bgr(img_bgr, sigma_list=(15, 80, 250), gain=0.30):
+    """
+    Multi-Scale Retinex — flattens uneven illumination (softer shadows) without HDR look.
+    """
+    img = img_bgr.astype(np.float32) + 1.0
+    log_img = np.log(img)
+    msr = np.zeros_like(img, dtype=np.float32)
+    w = 1.0 / len(sigma_list)
+    for s in sigma_list:
+        blur = cv2.GaussianBlur(img, (0,0), sigmaX=s, sigmaY=s)
+        msr += w * (log_img - np.log(blur + 1.0))
+    msr = img * (1.0 + gain * msr)
+    return np.clip(msr, 0, 255).astype(np.uint8)
+
+def local_contrast_bgr(img_bgr, clip=1.5):
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tiles)
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8,8))
     L = clahe.apply(L)
     return cv2.cvtColor(cv2.merge([L, A, B]), cv2.COLOR_LAB2BGR)
 
-def gentle_skin_balance_bgr(img_bgr, reduce_red=4, calm_yellow=2):
-    """
-    Ease redness/yellowness gently in LAB using subtraction to avoid uint8 underflow.
-    """
+def skin_mask_ycrcb(img_bgr):
+    """Simple skin mask to localize gentle adjustments (keeps background neutral)."""
+    ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
+    Y, Cr, Cb = cv2.split(ycrcb)
+    # loose thresholds to avoid holes
+    mask = cv2.inRange(ycrcb, (0, 135, 85), (255, 180, 135))
+    mask = cv2.GaussianBlur(mask, (7,7), 0)
+    return mask
+
+def soften_shadows_on_skin(img_bgr, strength=0.15):
+    """Lift shadows slightly only on skin to avoid flattening clothes/background."""
+    mask = skin_mask_ycrcb(img_bgr) / 255.0
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
-    A = cv2.subtract(A, np.full_like(A, reduce_red, dtype=np.uint8))
-    B = cv2.subtract(B, np.full_like(B, calm_yellow, dtype=np.uint8))
-    return cv2.cvtColor(cv2.merge([L, A, B]), cv2.COLOR_LAB2BGR)
+    Lf = L.astype(np.float32) / 255.0
+    lift = Lf + strength * (1 - np.exp(-3.0 * Lf))
+    L_out = (np.clip(Lf*(1-mask) + lift*mask, 0, 1) * 255).astype(np.uint8)
+    return cv2.cvtColor(cv2.merge([L_out, A, B]), cv2.COLOR_LAB2BGR)
 
-def mild_sharpen_bgr(img_bgr, amount=0.55, radius=1):
-    blur = cv2.GaussianBlur(img_bgr, (radius*2+1, radius*2+1), 0)
-    return cv2.addWeighted(img_bgr, 1 + amount, blur, -amount, 0)
-
-def suppress_color_noise_bgr(img_bgr, strength=6):
-    return cv2.fastNlMeansDenoisingColored(img_bgr, None, strength, strength, 7, 21)
-
-def tone_pipeline(pil_img, bright_strength=0.34, contrast_clip=1.9, sharpen_amt=0.55):
+def natural_pipeline(pil_img,
+                     retinex_gain=0.30,
+                     wb_p=6,
+                     tint_limit=6,
+                     clahe_clip=1.5,
+                     skin_shadow=0.15,
+                     sharpen=0.35):
     """
-    End-to-end tonal cleanup tuned for ID-style result:
-    WB → shadow lift → gentle skin balance → local contrast → mild denoise → sharpen → subtle color
+    Designed for NATURAL look:
+      • Remove uneven light/shadows (MSR)
+      • True-to-life white balance (Shades-of-Gray)
+      • Kill green/yellow cast (LAB median centering; small limits)
+      • Gentle local contrast
+      • Soften shadows on skin only (keeps clothes/background balanced)
+      • Mild sharpen + tiny color pop
     """
     img = ImageOps.exif_transpose(pil_img).convert("RGB")
     bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-    bgr = auto_white_balance_bgr(bgr)
-    bgr = lift_shadows_preserve_highlights_bgr(bgr, strength=bright_strength)
-    bgr = gentle_skin_balance_bgr(bgr, reduce_red=4, calm_yellow=2)
-    bgr = local_contrast_bgr(bgr, clip_limit=contrast_clip, tiles=(8,8))
-    bgr = suppress_color_noise_bgr(bgr, strength=6)
-    bgr = mild_sharpen_bgr(bgr, amount=sharpen_amt, radius=1)
+
+    # 1) Even out illumination
+    bgr = retinex_msr_bgr(bgr, sigma_list=(15,80,250), gain=retinex_gain)
+
+    # 2) White balance
+    bgr = shades_of_gray_wb_bgr(bgr, p=wb_p)
+
+    # 3) Remove tint (green/yellow/magenta/blue) gently
+    bgr = neutralize_tint_lab(bgr, limit=tint_limit)
+
+    # 4) Gentle local contrast
+    bgr = local_contrast_bgr(bgr, clip=clahe_clip)
+
+    # 5) Skin-only shadow softening
+    bgr = soften_shadows_on_skin(bgr, strength=skin_shadow)
+
+    # 6) Mild denoise + sharpen (natural texture)
+    bgr = cv2.fastNlMeansDenoisingColored(bgr, None, 2, 2, 7, 21)
+    blur = cv2.GaussianBlur(bgr, (3,3), 0)
+    bgr = cv2.addWeighted(bgr, 1.0 + sharpen, blur, -sharpen, 0)
+
     out = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-    # Subtle finishing
-    out = ImageEnhance.Color(out).enhance(1.04)
-    out = out.filter(ImageFilter.UnsharpMask(radius=1, percent=45, threshold=3))
+    out = ImageEnhance.Color(out).enhance(1.02)  # very light
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# BACKGROUND CLEANUP (cut-out + soft edge)
+# BACKGROUND CLEANUP (cut-out + soft edges)
 # ──────────────────────────────────────────────────────────────────────────────
-def soft_paste_on_bg(fg_rgba, bg_rgb=(255,255,255), feather_px=2, pad_px=16):
-    """
-    Place the cut-out subject on solid background with soft edges and a bit of padding.
-    """
-    fg_w, fg_h = fg_rgba.size
-    canvas = Image.new("RGB", (fg_w + pad_px*2, fg_h + pad_px*2), bg_rgb)
-
+def soft_paste_on_bg(fg_rgba: Image.Image, bg_rgb=(244,246,249), feather_px=2, pad_px=18):
+    W, H = fg_rgba.size
+    canvas = Image.new("RGB", (W + pad_px*2, H + pad_px*2), bg_rgb)
     if fg_rgba.mode != "RGBA":
         fg_rgba = fg_rgba.convert("RGBA")
-    r, g, b, a = fg_rgba.split()
-
+    r,g,b,a = fg_rgba.split()
     if feather_px > 0:
         a = a.filter(ImageFilter.GaussianBlur(radius=feather_px))
+    fg = Image.merge("RGBA", (r,g,b,a))
+    comp = Image.new("RGBA", canvas.size, bg_rgb + (255,))
+    comp.paste(fg, (pad_px, pad_px), mask=fg)
+    return comp.convert("RGB")
 
-    fg_rgba = Image.merge("RGBA", (r, g, b, a))
-    canvas_rgba = Image.new("RGBA", canvas.size, bg_rgb + (255,))
-    canvas_rgba.paste(fg_rgba, (pad_px, pad_px), mask=fg_rgba)
-    return canvas_rgba.convert("RGB")
-
-def cutout_with_rembg(pil_img, bg_choice="white", feather_px=2):
-    """
-    Remove background and place on selected clean background.
-    """
+def clean_background(pil_img, bg_choice="near-white", feather_px=2):
     if bg_choice == "white":
-        bg = (255, 255, 255)
+        bg = (255,255,255)
     elif bg_choice == "blue":
-        bg = (200, 224, 255)  # light ID blue
+        bg = (200,224,255)  # ID light blue
     else:
-        bg = (244, 246, 249)  # near-white default
+        bg = (244,246,249)  # near-white
 
-    cut = rembg_remove(pil_img.convert("RGBA"))
-    out = soft_paste_on_bg(cut, bg_rgb=bg, feather_px=feather_px, pad_px=18)
-    # Micro smoothing of edge halo
-    out = out.filter(ImageFilter.GaussianBlur(radius=0.3))
-    return out
-
-def grabcut_fallback(pil_img, bg_choice="white", feather_px=2):
-    """
-    Fallback background cleanup using GrabCut when rembg is not available.
-    Uses center-rect initialization; not as precise, but acceptable.
-    """
-    if bg_choice == "white":
-        bg = (255, 255, 255)
-    elif bg_choice == "blue":
-        bg = (200, 224, 255)
+    if HAS_REMBG:
+        cut = rembg_remove(pil_img.convert("RGBA"))
+        out = soft_paste_on_bg(cut, bg_rgb=bg, feather_px=feather_px, pad_px=18)
+        # micro smoothing along edges
+        return out.filter(ImageFilter.GaussianBlur(radius=0.25))
     else:
-        bg = (244, 246, 249)
-
-    img = pil_img.convert("RGB")
-    bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-    mask = np.zeros(bgr.shape[:2], np.uint8)
-    bgdModel = np.zeros((1, 65), np.float64)
-    fgdModel = np.zeros((1, 65), np.float64)
-
-    h, w = mask.shape
-    rect = (int(w*0.12), int(h*0.12), int(w*0.76), int(h*0.76))
-    cv2.grabCut(bgr, mask, rect, bgdModel, fgdModel, 5, cv2.GC_INIT_WITH_RECT)
-
-    mask2 = np.where((mask==2)|(mask==0), 0, 255).astype('uint8')
-    rgba = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
-    rgba[:,:,3] = mask2
-    cut = Image.fromarray(cv2.cvtColor(rgba, cv2.COLOR_BGRA2RGBA))
-
-    out = soft_paste_on_bg(cut, bg_rgb=bg, feather_px=feather_px, pad_px=18)
-    out = out.filter(ImageFilter.GaussianBlur(radius=0.3))
-    return out
+        # Simple GrabCut fallback
+        bgr = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+        mask = np.zeros(bgr.shape[:2], np.uint8)
+        bgd, fgd = np.zeros((1,65), np.float64), np.zeros((1,65), np.float64)
+        h, w = mask.shape
+        rect = (int(w*0.12), int(h*0.12), int(w*0.76), int(h*0.76))
+        try:
+            cv2.grabCut(bgr, mask, rect, bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
+            mask2 = np.where((mask==2)|(mask==0), 0, 255).astype('uint8')
+            rgba = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA); rgba[:,:,3] = mask2
+            cut = Image.fromarray(cv2.cvtColor(rgba, cv2.COLOR_BGRA2RGBA))
+            out = soft_paste_on_bg(cut, bg_rgb=bg, feather_px=feather_px, pad_px=18)
+            return out.filter(ImageFilter.GaussianBlur(radius=0.25))
+        except Exception:
+            # fallback: no cutout, just return original on solid canvas
+            backdrop = Image.new("RGB", pil_img.size, bg)
+            backdrop.paste(pil_img, (0,0))
+            return backdrop
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
-st.title("🪪 ID‑Style Portrait Cleaner")
-st.caption("Clean background • Natural bright tone • Centered head‑and‑shoulders • Print‑ready export")
+st.title("🪪 Natural ID‑Style Portrait")
+st.caption("Natural light • No green tint • Minimal shadows • Clean background (white / near‑white / blue)")
 
 with st.sidebar:
     st.header("⚙️ Settings")
-
-    uploaded = st.file_uploader("Upload Photo", type=["jpg", "jpeg", "png"])
-
-    st.markdown("### 🎨 Background")
-    bg_choice = st.selectbox("Choose background", ["near-white", "white", "blue"], index=0)
-    feather_px = st.slider("Edge feather (px)", 0, 6, 2, 1)
+    uploaded = st.file_uploader("Upload Photo", type=["jpg","jpeg","png"])
 
     st.markdown("### 🧭 Framing")
-    do_crop = st.checkbox("Face‑aware portrait crop (3:4)", value=True)
+    do_crop = st.checkbox("Face‑aware 3:4 crop (head‑and‑shoulders)", value=True)
 
-    st.markdown("### 🪄 Tone")
-    shadow_lift = st.slider("Shadow lift", 0.0, 0.7, 0.34, 0.01)
-    clahe_clip  = st.slider("Local contrast (CLAHE)", 1.2, 3.0, 1.9, 0.1)
-    sharpen_amt = st.slider("Sharpen", 0.0, 1.2, 0.55, 0.05)
+    st.markdown("### 🌈 Background")
+    bg_choice = st.selectbox("Background", ["near-white", "white", "blue"], index=0)
+    feather_px = st.slider("Edge feather", 0, 6, 2, 1)
+
+    st.markdown("### 💡 Natural Light Controls")
+    retinex_gain = st.slider("Shadow removal (Retinex)", 0.0, 0.6, 0.30, 0.01)
+    wb_p = st.slider("White balance p‑norm", 2, 12, 6, 1)
+    tint_limit = st.slider("Tint neutralization limit (LAB units)", 0, 12, 6, 1)
+    clahe_clip = st.slider("Local contrast (CLAHE)", 1.2, 3.0, 1.5, 0.1)
+    skin_shadow = st.slider("Skin shadow softening", 0.0, 0.4, 0.15, 0.01)
+    sharpen = st.slider("Sharpen", 0.0, 1.0, 0.35, 0.05)
 
     st.markdown("### 📐 Export")
     size_opt = st.selectbox("Final size", ["As‑is", "35×45 mm", "2×2 in"], index=0)
@@ -279,7 +287,7 @@ with st.sidebar:
     run = st.button("✨ Enhance", type="primary", use_container_width=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MAIN ACTION
+# MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 if uploaded and run:
     try:
@@ -295,46 +303,49 @@ if uploaded and run:
         with c2:
             st.subheader("Result")
 
-            # 1) Framing (3:4 head-and-shoulders)
+            # 1) Framing
             work = original.copy()
             if do_crop:
                 work = face_focus_crop(work, target_aspect=3/4, pad=0.22)
 
-            # 2) Tonal cleanup (natural bright)
-            work = tone_pipeline(work,
-                                 bright_strength=shadow_lift,
-                                 contrast_clip=clahe_clip,
-                                 sharpen_amt=sharpen_amt)
+            # 2) Natural tone
+            work = natural_pipeline(
+                work,
+                retinex_gain=retinex_gain,
+                wb_p=wb_p,
+                tint_limit=tint_limit,
+                clahe_clip=clahe_clip,
+                skin_shadow=skin_shadow,
+                sharpen=sharpen
+            )
 
-            # 3) Background cleanup (preferred: rembg)
-            if HAS_REMBG:
-                work = cutout_with_rembg(work, bg_choice=bg_choice, feather_px=feather_px)
-            else:
-                work = grabcut_fallback(work, bg_choice=bg_choice, feather_px=feather_px)
-                st.info("Note: Using GrabCut fallback. Install 'rembg' for cleaner edges.")
+            # 3) Clean background
+            work = clean_background(work, bg_choice=bg_choice, feather_px=feather_px)
 
-            # 4) Export size
+            # 4) Export sizing
             if size_opt != "As‑is":
                 if size_opt == "35×45 mm":
-                    work = place_on_canvas(work, target_mm=(35, 45), dpi=dpi, bg=(255,255,255))
+                    work = place_on_canvas(work, target_mm=(35,45), dpi=dpi, bg=(255,255,255))
                 elif size_opt == "2×2 in":
-                    work = place_on_canvas(work, target_mm=(50.8, 50.8), dpi=dpi, bg=(255,255,255))
+                    work = place_on_canvas(work, target_mm=(50.8,50.8), dpi=dpi, bg=(255,255,255))
 
             st.image(work, use_container_width=True)
-            st.success("✅ Done")
+            st.success("✅ Enhanced successfully")
 
-            # Download (high-quality JPEG)
-            jpeg_bytes = save_jpeg_bytes(work, quality=95, subsampling="4:4:4")
-            st.download_button("📥 Download", data=jpeg_bytes, file_name="portrait_clean.jpg",
-                                mime="image/jpeg", use_container_width=True)
+            # Download
+            st.download_button("📥 Download",
+                               data=save_jpeg_bytes(work, quality=95, subsampling="4:4:4"),
+                               file_name="natural_id_portrait.jpg",
+                               mime="image/jpeg",
+                               use_container_width=True)
 
     except Exception as e:
         st.error(f"Error: {str(e)}")
 
 else:
-    st.info("Upload a photo and click **Enhance** to generate the clean ID‑style portrait.")
+    st.info("Upload a photo then click **Enhance** for a clean, natural ID‑style portrait.")
     st.markdown("---")
     st.markdown(
-        "Tips: Use a well‑lit photo, face towards the camera, avoid strong color tints in the room. "
-        "Keep **Face‑aware crop** ON and **Background = near‑white/white** for the cleanest look."
+        "Tips: Iwasan ang colored room lights; humanap ng soft window light sa harap. "
+        "Kung may kulay pa rin, itaas nang kaunti ang **Tint neutralization**; kung may shadow pa, itaas ang **Retinex**."
     )
