@@ -34,7 +34,12 @@ def save_jpeg_bytes(pil_img, quality=95, subsampling="4:4:4"):
     """
     buf = io.BytesIO()
     pil_img = pil_img.convert("RGB")
-    subsampling_val = 0 if subsampling == "4:4:4" else "keep"
+    # Map subsampling string to Pillow values
+    if isinstance(subsampling, str):
+        ss_map = {"4:4:4": 0, "4:2:2": 1, "4:2:0": 2}
+        subsampling_val = ss_map.get(subsampling, 0)
+    else:
+        subsampling_val = int(subsampling)
     pil_img.save(buf, format="JPEG", quality=quality, subsampling=subsampling_val, optimize=True)
     return buf.getvalue()
 
@@ -95,7 +100,7 @@ def face_focus_crop(pil_img, target_aspect=3/4, pad=0.18):
 def enhance_with_gemini_direct(image: Image.Image, api_key: str, model_name: str, instructions: str):
     """
     Tries to get an enhanced image from Gemini.
-    - Removes response_mime_type to avoid 400 errors.
+    - No response_mime_type (avoids 400).
     - Parses inline_data if present.
     - If only text is returned, looks for a data URL or raw base64.
     Returns PIL.Image or None.
@@ -233,10 +238,15 @@ def local_contrast_bgr(img_bgr, clip_limit=2.0, tile_grid=(8,8)):
     return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
 def gentle_skin_tone_balance_bgr(img_bgr, reduce_red=5, calm_yellow=3):
+    """
+    Slightly reduce LAB A (red-green) and B (yellow-blue) channels.
+    Use cv2.subtract to avoid 'out of bounds for uint8' errors.
+    """
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
-    A = cv2.add(A, np.full_like(A, -reduce_red))
-    B = cv2.add(B, np.full_like(B, -calm_yellow))
+    # ❗ FIX: use subtract (positive values), not add with negative integers
+    A = cv2.subtract(A, np.full_like(A, reduce_red, dtype=np.uint8))
+    B = cv2.subtract(B, np.full_like(B, calm_yellow, dtype=np.uint8))
     merged = cv2.merge([L, A, B])
     return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
@@ -262,7 +272,9 @@ def eye_teeth_pop(pil_img, face_boxes, lift=0.08):
         x2 = int(x + fw*0.85)
         region = np.zeros_like(mask)
         region[eye_y1:eye_y2, x1:x2] = 1.0
-        region = cv2.GaussianBlur(region, (0,0), max(1, int(fh*0.08)))
+        # Smooth edges
+        sigma = max(1, int(fh*0.08))
+        region = cv2.GaussianBlur(region, (0, 0), sigmaX=sigma, sigmaY=sigma)
         mask = np.maximum(mask, region)
 
     mask = np.clip(mask, 0, 1) * lift
@@ -312,7 +324,7 @@ def enhance_with_gemini_fallback(image: Image.Image, instructions: str,
 
     bgr = auto_white_balance_bgr(bgr)
     bgr = lift_shadows_preserve_highlights_bgr(bgr, strength=strength_bright)
-    bgr = gentle_skin_tone_balance_bgr(bgr, reduce_red=5, calm_yellow=3)
+    bgr = gentle_skin_tone_balance_bgr(bgr, reduce_red=5, calm_yellow=3)  # <-- fixed subtraction
     bgr = local_contrast_bgr(bgr, clip_limit=contrast_clip, tile_grid=(8,8))
     bgr = mild_sharpen_bgr(bgr, amount=sharpen_amt, radius=1)
 
