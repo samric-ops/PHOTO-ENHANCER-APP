@@ -1,8 +1,9 @@
+# AI Portrait Cleaner — ID-Style
+# Fresh build: clean white/near-white/blue background, natural bright tone, centered crop, crisp details.
+# No Gemini required. Uses rembg for precise cut-out + edge feather + tuned relight pipeline.
+
 import streamlit as st
-import requests
 import io
-import base64
-import re
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import numpy as np
 import cv2
@@ -14,458 +15,326 @@ try:
 except Exception:
     HAS_REMBG = False
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="AI Photo Enhancer", page_icon="📸", layout="wide")
+# ──────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ──────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="ID-Style Portrait Cleaner", page_icon="🪪", layout="wide")
 
-# --- GEMINI API CONFIG ---
-GEMINI_MODELS = {
-    "Gemini 2.5 Flash (Latest)": "gemini-2.5-flash",
-    "Gemini 1.5 Pro (Best Quality)": "gemini-1.5-pro",
-    "Gemini 1.5 Flash (Balanced)": "gemini-1.5-flash"
-}
-
-# ------------------------------
-# Utility: Safe JPEG export (studio)
-# ------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPORT HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
 def save_jpeg_bytes(pil_img, quality=95, subsampling="4:4:4"):
     """
-    Exports JPEG with high quality and 4:4:4 subsampling to reduce color banding.
-    Returns bytes.
+    High-quality JPEG export with 4:4:4 subsampling to keep skin gradients smooth.
     """
     buf = io.BytesIO()
     pil_img = pil_img.convert("RGB")
-    # Map subsampling string to Pillow values
-    if isinstance(subsampling, str):
-        ss_map = {"4:4:4": 0, "4:2:2": 1, "4:2:0": 2}
-        subsampling_val = ss_map.get(subsampling, 0)
-    else:
-        subsampling_val = int(subsampling)
-    pil_img.save(buf, format="JPEG", quality=quality, subsampling=subsampling_val, optimize=True)
+    subsampling_map = {"4:4:4": 0, "4:2:2": 1, "4:2:0": 2}
+    ss = subsampling_map.get(subsampling, 0)
+    pil_img.save(buf, format="JPEG", quality=quality, subsampling=ss, optimize=True)
     return buf.getvalue()
 
-# ------------------------------
-# Face detection and framing
-# ------------------------------
+def mm_to_pixels(mm, dpi=300):
+    inches = float(mm) / 25.4
+    return int(round(inches * dpi))
+
+def place_on_canvas(pil_img, target_mm=(35, 45), dpi=300, bg=(255, 255, 255)):
+    """
+    Center the image on an exact-size canvas (e.g., 35x45 mm) at chosen DPI.
+    Keeps small margin around subject for clean print.
+    """
+    tw = mm_to_pixels(target_mm[0], dpi)
+    th = mm_to_pixels(target_mm[1], dpi)
+    canvas = Image.new("RGB", (tw, th), bg)
+    iw, ih = pil_img.size
+    # Fit inside with a small border
+    scale = min((tw - 12) / iw, (th - 12) / ih)
+    nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+    resized = pil_img.resize((nw, nh), Image.LANCZOS)
+    x = (tw - nw) // 2
+    y = (th - nh) // 2
+    canvas.paste(resized, (x, y))
+    return canvas
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FACE & FRAMING
+# ──────────────────────────────────────────────────────────────────────────────
 def detect_faces_bboxes(pil_img):
     img = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
     return faces
 
-def face_focus_crop(pil_img, target_aspect=3/4, pad=0.18):
+def face_focus_crop(pil_img, target_aspect=3/4, pad=0.22):
     """
-    Crop around the largest face to portrait 3:4 aspect with padding.
+    Crop to a portrait-friendly 3:4 aspect around the largest face,
+    with margins that keep hairline and shoulders for an ID look.
     """
-    img_w, img_h = pil_img.size
+    w, h = pil_img.size
     faces = detect_faces_bboxes(pil_img)
     if len(faces) == 0:
+        # No face detected → return original (user can crop manually if needed)
         return pil_img
 
-    faces_sorted = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)
-    (x, y, w, h) = faces_sorted[0]
+    # largest face
+    (x, y, fw, fh) = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[0]
+    cx, cy = x + fw / 2, y + fh / 2
 
-    cx = x + w/2
-    cy = y + h/2
+    # Box height with padding; width from aspect; ensure shoulders margin
+    box_h = fh * (1 + pad * 3.2)
+    box_w = max(fw * (1 + pad * 2.4), box_h * target_aspect)
 
-    box_h = h * (1 + pad*3.0)
-    box_w = box_h * target_aspect
-    box_w = max(box_w, w * (1 + pad*2.0))
+    left = int(max(0, cx - box_w / 2))
+    top = int(max(0, cy - fh * 0.70))       # slightly higher to include more shoulder
+    right = int(min(w, left + box_w))
+    bottom = int(min(h, top + box_h))
 
-    left = int(max(0, cx - box_w/2))
-    top = int(max(0, cy - h*0.6))
-    right = int(min(img_w, left + box_w))
-    bottom = int(min(img_h, top + box_h))
-
-    crop_w = right - left
-    crop_h = bottom - top
-    current_aspect = crop_w / max(1, crop_h)
-    if current_aspect > target_aspect:
-        new_w = int(crop_h * target_aspect)
-        dx = (crop_w - new_w)//2
+    # Enforce 3:4 exact
+    cw, ch = right - left, bottom - top
+    cur_aspect = cw / max(1, ch)
+    if cur_aspect > target_aspect:
+        new_w = int(ch * target_aspect)
+        dx = (cw - new_w) // 2
         left += dx
         right = left + new_w
     else:
-        new_h = int(crop_w / target_aspect)
-        dy = (crop_h - new_h)//2
+        new_h = int(cw / target_aspect)
+        dy = (ch - new_h) // 2
         top += dy
         bottom = top + new_h
 
-    left, top, right, bottom = map(lambda v: int(np.clip(v, 0, None)), (left, top, right, bottom))
+    left, top, right, bottom = map(int, [max(0, left), max(0, top), min(w, right), min(h, bottom)])
     return pil_img.crop((left, top, right, bottom))
 
-# ------------------------------
-# Gemini direct enhancement (text-friendly; parses base64 if present)
-# ------------------------------
-def enhance_with_gemini_direct(image: Image.Image, api_key: str, model_name: str, instructions: str):
-    """
-    Tries to get an enhanced image from Gemini.
-    - No response_mime_type (avoids 400).
-    - Parses inline_data if present.
-    - If only text is returned, looks for a data URL or raw base64.
-    Returns PIL.Image or None.
-    """
-    try:
-        buffered = io.BytesIO()
-        image = image.convert("RGB")
-        image.save(buffered, format="JPEG", quality=100)
-        img_base64 = base64.b64encode(buffered.getvalue()).decode()
-
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-
-        prompt = f"""
-You are an expert studio photo retoucher. Apply ONLY the requested edits, preserving identity and natural texture.
-
-Instructions:
-{instructions}
-
-Hard requirements:
-- If possible, return the ENHANCED IMAGE as base64 (prefer a data URL format like: data:image/jpeg;base64,....).
-- If you cannot return image bytes, respond with a single line JSON object: {{"note":"no_image_capability"}}.
-"""
-
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": img_base64
-                        }
-                    }
-                ]
-            }],
-            "generationConfig": {
-                "temperature": 0.1,
-                "topK": 1,
-                "topP": 1,
-                "maxOutputTokens": 2048
-            }
-        }
-
-        response = requests.post(
-            f"{api_url}?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json=payload,
-            timeout=60
-        )
-
-        if response.status_code != 200:
-            st.error(f"API Error: {response.status_code} - {response.text[:200]}")
-            return None
-
-        result = response.json()
-
-        # 1) Try standard inline_data
-        if 'candidates' in result and len(result['candidates']) > 0:
-            parts = result['candidates'][0].get('content', {}).get('parts', [])
-
-            for part in parts:
-                if 'inline_data' in part and 'data' in part['inline_data']:
-                    try:
-                        img_data = base64.b64decode(part['inline_data']['data'])
-                        return Image.open(io.BytesIO(img_data)).convert("RGB")
-                    except Exception:
-                        pass
-
-            # 2) Parse base64 from text parts
-            text_blobs = []
-            for part in parts:
-                if 'text' in part and isinstance(part['text'], str):
-                    text_blobs.append(part['text'])
-            combined = "\n".join(text_blobs).strip()
-
-            if combined:
-                # data URL
-                m = re.search(r'data:image/(?:jpeg|jpg|png);base64,([A-Za-z0-9+/=]+)', combined, re.IGNORECASE)
-                if m:
-                    try:
-                        img_data = base64.b64decode(m.group(1))
-                        return Image.open(io.BytesIO(img_data)).convert("RGB")
-                    except Exception:
-                        pass
-
-                # longest base64-ish chunk
-                candidates = re.findall(r'([A-Za-z0-9+/=\s]{200,})', combined)
-                candidates = [c.replace("\n", "").replace(" ", "") for c in candidates]
-                candidates = sorted(candidates, key=len, reverse=True)
-                for c in candidates[:3]:
-                    try:
-                        img_data = base64.b64decode(c)
-                        return Image.open(io.BytesIO(img_data)).convert("RGB")
-                    except Exception:
-                        continue
-
-        return None
-
-    except Exception as e:
-        st.error(f"Gemini error: {str(e)}")
-        return None
-
-# ------------------------------
-# Local PRO-grade fallback pipeline
-# ------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# TONE / RELIGHT PIPELINE (natural brightness, clean color, crisp details)
+# ──────────────────────────────────────────────────────────────────────────────
 def auto_white_balance_bgr(img_bgr):
+    """
+    Gray-world white balance for natural color; robust and fast.
+    """
     result = img_bgr.astype(np.float32)
-    avg_b, avg_g, avg_r = np.mean(result[:,:,0]), np.mean(result[:,:,1]), np.mean(result[:,:,2])
+    b, g, r = result[:,:,0], result[:,:,1], result[:,:,2]
+    avg_b, avg_g, avg_r = b.mean(), g.mean(), r.mean()
     avg_gray = (avg_b + avg_g + avg_r) / 3.0
-    scale_b = avg_gray / (avg_b + 1e-6)
-    scale_g = avg_gray / (avg_g + 1e-6)
-    scale_r = avg_gray / (avg_r + 1e-6)
-    result[:,:,0] *= scale_b
-    result[:,:,1] *= scale_g
-    result[:,:,2] *= scale_r
-    result = np.clip(result, 0, 255).astype(np.uint8)
-    return result
+    eps = 1e-6
+    result[:,:,0] *= avg_gray / (avg_b + eps)
+    result[:,:,1] *= avg_gray / (avg_g + eps)
+    result[:,:,2] *= avg_gray / (avg_r + eps)
+    return np.clip(result, 0, 255).astype(np.uint8)
 
-def lift_shadows_preserve_highlights_bgr(img_bgr, strength=0.35):
+def lift_shadows_preserve_highlights_bgr(img_bgr, strength=0.34):
+    """
+    Lift shadowed regions more than highlights via an S-curve in Lab L channel.
+    """
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
     Lf = L.astype(np.float32) / 255.0
     lifted = Lf + strength * (1 - np.exp(-3.0 * Lf))
-    lifted = np.clip(lifted, 0, 1)
-    L_out = (lifted * 255).astype(np.uint8)
-    lab = cv2.merge([L_out, A, B])
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    L_out = (np.clip(lifted, 0, 1) * 255).astype(np.uint8)
+    return cv2.cvtColor(cv2.merge([L_out, A, B]), cv2.COLOR_LAB2BGR)
 
-def local_contrast_bgr(img_bgr, clip_limit=2.0, tile_grid=(8,8)):
+def local_contrast_bgr(img_bgr, clip_limit=1.9, tiles=(8,8)):
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tiles)
     L = clahe.apply(L)
-    merged = cv2.merge([L, A, B])
-    return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+    return cv2.cvtColor(cv2.merge([L, A, B]), cv2.COLOR_LAB2BGR)
 
-def gentle_skin_tone_balance_bgr(img_bgr, reduce_red=5, calm_yellow=3):
+def gentle_skin_balance_bgr(img_bgr, reduce_red=4, calm_yellow=2):
     """
-    Slightly reduce LAB A (red-green) and B (yellow-blue) channels.
-    Use cv2.subtract to avoid 'out of bounds for uint8' errors.
+    Ease redness/yellowness gently in LAB using subtraction to avoid uint8 underflow.
     """
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
-    # ❗ FIX: use subtract (positive values), not add with negative integers
     A = cv2.subtract(A, np.full_like(A, reduce_red, dtype=np.uint8))
     B = cv2.subtract(B, np.full_like(B, calm_yellow, dtype=np.uint8))
-    merged = cv2.merge([L, A, B])
-    return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+    return cv2.cvtColor(cv2.merge([L, A, B]), cv2.COLOR_LAB2BGR)
 
-def mild_sharpen_bgr(img_bgr, amount=0.7, radius=1):
+def mild_sharpen_bgr(img_bgr, amount=0.55, radius=1):
     blur = cv2.GaussianBlur(img_bgr, (radius*2+1, radius*2+1), 0)
-    sharp = cv2.addWeighted(img_bgr, 1 + amount, blur, -amount, 0)
-    return sharp
+    return cv2.addWeighted(img_bgr, 1 + amount, blur, -amount, 0)
 
-def eye_teeth_pop(pil_img, face_boxes, lift=0.08):
+def suppress_color_noise_bgr(img_bgr, strength=6):
+    return cv2.fastNlMeansDenoisingColored(img_bgr, None, strength, strength, 7, 21)
+
+def tone_pipeline(pil_img, bright_strength=0.34, contrast_clip=1.9, sharpen_amt=0.55):
     """
-    Subtle brightness lift around eyes/teeth area.
+    End-to-end tonal cleanup tuned for ID-style result:
+    WB → shadow lift → gentle skin balance → local contrast → mild denoise → sharpen → subtle color
     """
-    if len(face_boxes) == 0:
-        return pil_img
-    img = np.array(pil_img.convert("RGB")).astype(np.float32) / 255.0
-    h, w, _ = img.shape
-    mask = np.zeros((h, w), dtype=np.float32)
-
-    for (x, y, fw, fh) in face_boxes:
-        eye_y1 = int(y + fh*0.25)
-        eye_y2 = int(y + fh*0.55)
-        x1 = int(x + fw*0.15)
-        x2 = int(x + fw*0.85)
-        region = np.zeros_like(mask)
-        region[eye_y1:eye_y2, x1:x2] = 1.0
-        # Smooth edges
-        sigma = max(1, int(fh*0.08))
-        region = cv2.GaussianBlur(region, (0, 0), sigmaX=sigma, sigmaY=sigma)
-        mask = np.maximum(mask, region)
-
-    mask = np.clip(mask, 0, 1) * lift
-    img[:,:,0] = np.clip(img[:,:,0] + mask, 0, 1)
-    img[:,:,1] = np.clip(img[:,:,1] + mask, 0, 1)
-    img[:,:,2] = np.clip(img[:,:,2] + mask, 0, 1)
-
-    img = (img*255).astype(np.uint8)
-    return Image.fromarray(img)
-
-def background_cleanup(pil_img, mode="keep", bg_color=(245,245,245)):
-    """
-    mode: "keep" (no change), "clean" (denoise background), "remove" (cut subject, replace with solid bg)
-    """
-    if mode == "keep":
-        return pil_img
-
-    if mode == "clean":
-        img = np.array(pil_img.convert("RGB"))
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        clean = cv2.bilateralFilter(img_bgr, d=7, sigmaColor=40, sigmaSpace=40)
-        clean = cv2.cvtColor(clean, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(clean)
-
-    if mode == "remove":
-        if not HAS_REMBG:
-            st.warning("Background removal not available (rembg not installed).")
-            return pil_img
-        cut = rembg_remove(pil_img.convert("RGBA"))
-        bg = Image.new("RGBA", cut.size, bg_color + (255,))
-        out = Image.alpha_composite(bg, cut)
-        return out.convert("RGB")
-
-    return pil_img
-
-def enhance_with_gemini_fallback(image: Image.Image, instructions: str,
-                                 strength_bright=0.35, contrast_clip=2.0,
-                                 sharpen_amt=0.6, bg_mode="keep", face_crop=False):
-    """
-    PRO-grade local pipeline for reliable studio-like portrait enhancement.
-    """
-    img = ImageOps.exif_transpose(image).convert("RGB")
-    if face_crop:
-        img = face_focus_crop(img, target_aspect=3/4, pad=0.20)
-
+    img = ImageOps.exif_transpose(pil_img).convert("RGB")
     bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
     bgr = auto_white_balance_bgr(bgr)
-    bgr = lift_shadows_preserve_highlights_bgr(bgr, strength=strength_bright)
-    bgr = gentle_skin_tone_balance_bgr(bgr, reduce_red=5, calm_yellow=3)  # <-- fixed subtraction
-    bgr = local_contrast_bgr(bgr, clip_limit=contrast_clip, tile_grid=(8,8))
+    bgr = lift_shadows_preserve_highlights_bgr(bgr, strength=bright_strength)
+    bgr = gentle_skin_balance_bgr(bgr, reduce_red=4, calm_yellow=2)
+    bgr = local_contrast_bgr(bgr, clip_limit=contrast_clip, tiles=(8,8))
+    bgr = suppress_color_noise_bgr(bgr, strength=6)
     bgr = mild_sharpen_bgr(bgr, amount=sharpen_amt, radius=1)
-
     out = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-
-    faces = detect_faces_bboxes(out)
-    out = eye_teeth_pop(out, faces, lift=0.07)
-
-    out = background_cleanup(out, mode=bg_mode, bg_color=(245,245,245))
-
-    out = ImageEnhance.Color(out).enhance(1.06)
-    out = out.filter(ImageFilter.UnsharpMask(radius=1, percent=60, threshold=3))
-
+    # Subtle finishing
+    out = ImageEnhance.Color(out).enhance(1.04)
+    out = out.filter(ImageFilter.UnsharpMask(radius=1, percent=45, threshold=3))
     return out
 
-# ------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# BACKGROUND CLEANUP (cut-out + soft edge)
+# ──────────────────────────────────────────────────────────────────────────────
+def soft_paste_on_bg(fg_rgba, bg_rgb=(255,255,255), feather_px=2, pad_px=16):
+    """
+    Place the cut-out subject on solid background with soft edges and a bit of padding.
+    """
+    fg_w, fg_h = fg_rgba.size
+    canvas = Image.new("RGB", (fg_w + pad_px*2, fg_h + pad_px*2), bg_rgb)
+
+    if fg_rgba.mode != "RGBA":
+        fg_rgba = fg_rgba.convert("RGBA")
+    r, g, b, a = fg_rgba.split()
+
+    if feather_px > 0:
+        a = a.filter(ImageFilter.GaussianBlur(radius=feather_px))
+
+    fg_rgba = Image.merge("RGBA", (r, g, b, a))
+    canvas_rgba = Image.new("RGBA", canvas.size, bg_rgb + (255,))
+    canvas_rgba.paste(fg_rgba, (pad_px, pad_px), mask=fg_rgba)
+    return canvas_rgba.convert("RGB")
+
+def cutout_with_rembg(pil_img, bg_choice="white", feather_px=2):
+    """
+    Remove background and place on selected clean background.
+    """
+    if bg_choice == "white":
+        bg = (255, 255, 255)
+    elif bg_choice == "blue":
+        bg = (200, 224, 255)  # light ID blue
+    else:
+        bg = (244, 246, 249)  # near-white default
+
+    cut = rembg_remove(pil_img.convert("RGBA"))
+    out = soft_paste_on_bg(cut, bg_rgb=bg, feather_px=feather_px, pad_px=18)
+    # Micro smoothing of edge halo
+    out = out.filter(ImageFilter.GaussianBlur(radius=0.3))
+    return out
+
+def grabcut_fallback(pil_img, bg_choice="white", feather_px=2):
+    """
+    Fallback background cleanup using GrabCut when rembg is not available.
+    Uses center-rect initialization; not as precise, but acceptable.
+    """
+    if bg_choice == "white":
+        bg = (255, 255, 255)
+    elif bg_choice == "blue":
+        bg = (200, 224, 255)
+    else:
+        bg = (244, 246, 249)
+
+    img = pil_img.convert("RGB")
+    bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+    mask = np.zeros(bgr.shape[:2], np.uint8)
+    bgdModel = np.zeros((1, 65), np.float64)
+    fgdModel = np.zeros((1, 65), np.float64)
+
+    h, w = mask.shape
+    rect = (int(w*0.12), int(h*0.12), int(w*0.76), int(h*0.76))
+    cv2.grabCut(bgr, mask, rect, bgdModel, fgdModel, 5, cv2.GC_INIT_WITH_RECT)
+
+    mask2 = np.where((mask==2)|(mask==0), 0, 255).astype('uint8')
+    rgba = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+    rgba[:,:,3] = mask2
+    cut = Image.fromarray(cv2.cvtColor(rgba, cv2.COLOR_BGRA2RGBA))
+
+    out = soft_paste_on_bg(cut, bg_rgb=bg, feather_px=feather_px, pad_px=18)
+    out = out.filter(ImageFilter.GaussianBlur(radius=0.3))
+    return out
+
+# ──────────────────────────────────────────────────────────────────────────────
 # UI
-# ------------------------------
-st.title("📸 AI Photo Enhancer")
-st.markdown("### ✨ Gemini AI + Pro Local Pipeline for Studio-Grade Results")
+# ──────────────────────────────────────────────────────────────────────────────
+st.title("🪪 ID‑Style Portrait Cleaner")
+st.caption("Clean background • Natural bright tone • Centered head‑and‑shoulders • Print‑ready export")
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    api_key = st.text_input("Gemini API Key", type="password",
-                            help="Get from https://makersuite.google.com/app/apikey")
-    selected_model = st.selectbox("Gemini Model", list(GEMINI_MODELS.keys()), index=0)
-    model_name = GEMINI_MODELS[selected_model]
 
-    uploaded_file = st.file_uploader("Upload Photo", type=["jpg", "png", "jpeg"])
+    uploaded = st.file_uploader("Upload Photo", type=["jpg", "jpeg", "png"])
 
-    st.markdown("---")
-    st.subheader("🎨 Enhancement Style")
-    style = st.selectbox(
-        "Select Style",
-        [
-            "Ultra Bright ID Photo",
-            "Professional Studio Portrait",
-            "Natural Bright",
-            "Custom"
-        ]
-    )
-    if style == "Custom":
-        custom_instructions = st.text_area(
-            "Custom Instructions",
-            value="Bright, even studio lighting on face, natural skin tones, remove facial shadows, preserve texture, crisp details."
-        )
-    else:
-        if style == "Ultra Bright ID Photo":
-            instructions = ("Make this an ultra bright ID portrait. Face should be very bright and evenly lit, "
-                            "no harsh shadows, natural skin tone, clean neutral background feel, sharp details. "
-                            "Preserve identity and natural texture.")
-        elif style == "Professional Studio Portrait":
-            instructions = ("Enhance into a professional studio portrait: balanced key+fill lighting, bright and clear face, "
-                            "natural skin tone, remove minor blemishes, preserve pores, gentle contrast and clarity.")
-        elif style == "Natural Bright":
-            instructions = ("Brighten the face while keeping it natural. Lift shadows softly, maintain skin texture, "
-                            "avoid over-smoothing, gentle contrast and color balance.")
+    st.markdown("### 🎨 Background")
+    bg_choice = st.selectbox("Choose background", ["near-white", "white", "blue"], index=0)
+    feather_px = st.slider("Edge feather (px)", 0, 6, 2, 1)
 
-    st.markdown("---")
-    st.subheader("🪄 Pro Controls")
-    face_crop = st.checkbox("Face-aware portrait crop (3:4)", value=(style in ["Ultra Bright ID Photo", "Professional Studio Portrait"]))
-    bg_mode = st.selectbox("Background", ["keep", "clean", "remove"], index=0)
-    bright_strength = st.slider("Shadow lift / Brightness", 0.0, 0.7, 0.35, 0.01)
-    contrast_clip = st.slider("Local contrast (CLAHE clip)", 1.0, 3.0, 2.0, 0.1)
-    sharpen_amt = st.slider("Sharpen amount", 0.0, 1.2, 0.6, 0.05)
+    st.markdown("### 🧭 Framing")
+    do_crop = st.checkbox("Face‑aware portrait crop (3:4)", value=True)
 
-    enhance_btn = st.button("✨ Enhance with AI", type="primary", use_container_width=True)
+    st.markdown("### 🪄 Tone")
+    shadow_lift = st.slider("Shadow lift", 0.0, 0.7, 0.34, 0.01)
+    clahe_clip  = st.slider("Local contrast (CLAHE)", 1.2, 3.0, 1.9, 0.1)
+    sharpen_amt = st.slider("Sharpen", 0.0, 1.2, 0.55, 0.05)
 
-# ------------------------------
-# Main
-# ------------------------------
-if uploaded_file and enhance_btn:
+    st.markdown("### 📐 Export")
+    size_opt = st.selectbox("Final size", ["As‑is", "35×45 mm", "2×2 in"], index=0)
+    dpi = st.number_input("DPI", value=300, min_value=150, max_value=600, step=50)
+
+    run = st.button("✨ Enhance", type="primary", use_container_width=True)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN ACTION
+# ──────────────────────────────────────────────────────────────────────────────
+if uploaded and run:
     try:
-        original = Image.open(uploaded_file)
-        original = ImageOps.exif_transpose(original)
+        original = Image.open(uploaded)
+        original = ImageOps.exif_transpose(original).convert("RGB")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("📷 Original")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Original")
             st.image(original, use_container_width=True)
             st.caption(f"Size: {original.size[0]}×{original.size[1]}")
 
-        with col2:
-            st.subheader("✨ AI Enhanced")
+        with c2:
+            st.subheader("Result")
 
-            if style == "Custom":
-                inst = custom_instructions
+            # 1) Framing (3:4 head-and-shoulders)
+            work = original.copy()
+            if do_crop:
+                work = face_focus_crop(work, target_aspect=3/4, pad=0.22)
+
+            # 2) Tonal cleanup (natural bright)
+            work = tone_pipeline(work,
+                                 bright_strength=shadow_lift,
+                                 contrast_clip=clahe_clip,
+                                 sharpen_amt=sharpen_amt)
+
+            # 3) Background cleanup (preferred: rembg)
+            if HAS_REMBG:
+                work = cutout_with_rembg(work, bg_choice=bg_choice, feather_px=feather_px)
             else:
-                inst = instructions
+                work = grabcut_fallback(work, bg_choice=bg_choice, feather_px=feather_px)
+                st.info("Note: Using GrabCut fallback. Install 'rembg' for cleaner edges.")
 
-            enhanced = None
-            used_gemini = False
+            # 4) Export size
+            if size_opt != "As‑is":
+                if size_opt == "35×45 mm":
+                    work = place_on_canvas(work, target_mm=(35, 45), dpi=dpi, bg=(255,255,255))
+                elif size_opt == "2×2 in":
+                    work = place_on_canvas(work, target_mm=(50.8, 50.8), dpi=dpi, bg=(255,255,255))
 
-            if api_key:
-                with st.spinner(f"🤖 {selected_model} (Gemini) is enhancing your photo..."):
-                    enhanced = enhance_with_gemini_direct(original, api_key, model_name, inst)
-                    if enhanced is not None:
-                        used_gemini = True
+            st.image(work, use_container_width=True)
+            st.success("✅ Done")
 
-            if enhanced is None:
-                with st.spinner("Applying local pro-grade enhancement..."):
-                    enhanced = enhance_with_gemini_fallback(
-                        original, inst,
-                        strength_bright=bright_strength,
-                        contrast_clip=contrast_clip,
-                        sharpen_amt=sharpen_amt,
-                        bg_mode=bg_mode,
-                        face_crop=face_crop
-                    )
-                st.info("ℹ️ Gemini model/endpoint returned text only or no image. Using built-in pro-grade enhancement.")
-
-            st.image(enhanced, use_container_width=True)
-            if used_gemini:
-                st.success("✅ Enhanced by Gemini AI!")
-            else:
-                st.success("✅ Enhanced by Pro Local Pipeline")
-
-            jpeg_bytes = save_jpeg_bytes(enhanced, quality=95, subsampling="4:4:4")
-            st.download_button(
-                label="📥 Download Enhanced Photo",
-                data=jpeg_bytes,
-                file_name="ai_enhanced_photo.jpg",
-                mime="image/jpeg",
-                use_container_width=True
-            )
+            # Download (high-quality JPEG)
+            jpeg_bytes = save_jpeg_bytes(work, quality=95, subsampling="4:4:4")
+            st.download_button("📥 Download", data=jpeg_bytes, file_name="portrait_clean.jpg",
+                                mime="image/jpeg", use_container_width=True)
 
     except Exception as e:
         st.error(f"Error: {str(e)}")
 
 else:
-    st.info("👆 Upload a photo and click 'Enhance with AI'")
-
+    st.info("Upload a photo and click **Enhance** to generate the clean ID‑style portrait.")
     st.markdown("---")
-    st.markdown("### How to get the BEST results:")
-    st.markdown("""
-1. **Get a free API key** from https://makersuite.google.com/app/apikey  
-2. **Upload a clear, well-exposed photo** (avoid heavy motion blur)  
-3. **Select a style**:
-   - **Ultra Bright ID Photo** – sobrang linis at maliwanag, pang-ID
-   - **Professional Studio Portrait** – parang studio shot
-   - **Natural Bright** – maliwanag pero natural ang dating  
-4. **Optional**: Turn on **Face-aware crop** and **Background clean/remove**  
-5. **Download** the result as high-quality JPEG (4:4:4, Q95)
-""")
+    st.markdown(
+        "Tips: Use a well‑lit photo, face towards the camera, avoid strong color tints in the room. "
+        "Keep **Face‑aware crop** ON and **Background = near‑white/white** for the cleanest look."
+    )
