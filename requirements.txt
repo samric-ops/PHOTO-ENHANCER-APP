@@ -4,4 +4,3 @@ numpy
 Pillow
 rembg
 onnxruntime
-google-generativeai
