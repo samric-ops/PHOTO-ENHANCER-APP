@@ -19,7 +19,7 @@ st.set_page_config(page_title="AI Photo Enhancer", page_icon="📸", layout="wid
 
 # --- GEMINI API CONFIG ---
 GEMINI_MODELS = {
-    "Gemini 2.0 Flash (Fastest)": "gemini-2.0-flash-exp",
+    "Gemini 2.5 Flash (Latest)": "gemini-2.5-flash",
     "Gemini 1.5 Pro (Best Quality)": "gemini-1.5-pro",
     "Gemini 1.5 Flash (Balanced)": "gemini-1.5-flash"
 }
