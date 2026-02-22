@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import io
 import base64
-import json
+import re
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import numpy as np
 import cv2
@@ -29,70 +29,58 @@ GEMINI_MODELS = {
 # ------------------------------
 def save_jpeg_bytes(pil_img, quality=95, subsampling="4:4:4"):
     """
-    Exports JPEG with higher quality and 4:4:4 to reduce color banding and
-    preserve skin gradients. Returns bytes.
+    Exports JPEG with high quality and 4:4:4 subsampling to reduce color banding.
+    Returns bytes.
     """
     buf = io.BytesIO()
     pil_img = pil_img.convert("RGB")
-    # Pillow uses subsampling mapping via 'subsampling' param in newer versions.
-    # Accept "4:4:4" or 0 as no subsampling.
     subsampling_val = 0 if subsampling == "4:4:4" else "keep"
     pil_img.save(buf, format="JPEG", quality=quality, subsampling=subsampling_val, optimize=True)
     return buf.getvalue()
 
 # ------------------------------
-# Utility: Face detection (to drive exposure and crop)
+# Face detection and framing
 # ------------------------------
 def detect_faces_bboxes(pil_img):
     img = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    # Use OpenCV's default Haar cascade
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
     return faces
 
 def face_focus_crop(pil_img, target_aspect=3/4, pad=0.18):
     """
-    Crops the image around the largest face to a portrait-friendly aspect ratio (3:4),
-    adding padding to keep shoulders and hairline when possible.
+    Crop around the largest face to portrait 3:4 aspect with padding.
     """
     img_w, img_h = pil_img.size
     faces = detect_faces_bboxes(pil_img)
     if len(faces) == 0:
-        return pil_img  # no crop
+        return pil_img
 
-    # Pick largest face
     faces_sorted = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)
     (x, y, w, h) = faces_sorted[0]
 
     cx = x + w/2
     cy = y + h/2
 
-    # Estimate head + shoulders framing box
     box_h = h * (1 + pad*3.0)
     box_w = box_h * target_aspect
-
-    # Adjust width to fit horizontally
     box_w = max(box_w, w * (1 + pad*2.0))
 
     left = int(max(0, cx - box_w/2))
-    top = int(max(0, cy - h*0.6))  # shift up a bit so more chest included
+    top = int(max(0, cy - h*0.6))
     right = int(min(img_w, left + box_w))
     bottom = int(min(img_h, top + box_h))
 
-    # Adjust to maintain exact target aspect
     crop_w = right - left
     crop_h = bottom - top
     current_aspect = crop_w / max(1, crop_h)
-
     if current_aspect > target_aspect:
-        # too wide, trim sides
         new_w = int(crop_h * target_aspect)
         dx = (crop_w - new_w)//2
         left += dx
         right = left + new_w
     else:
-        # too tall, trim top/bottom
         new_h = int(crop_w / target_aspect)
         dy = (crop_h - new_h)//2
         top += dy
@@ -102,16 +90,18 @@ def face_focus_crop(pil_img, target_aspect=3/4, pad=0.18):
     return pil_img.crop((left, top, right, bottom))
 
 # ------------------------------
-# Gemini direct enhancement
+# Gemini direct enhancement (text-friendly; parses base64 if present)
 # ------------------------------
 def enhance_with_gemini_direct(image: Image.Image, api_key: str, model_name: str, instructions: str):
     """
-    Attempts to have Gemini return a binary enhanced image directly.
-    If the model/endpoint doesn't support image return, returns None.
+    Tries to get an enhanced image from Gemini.
+    - Removes response_mime_type to avoid 400 errors.
+    - Parses inline_data if present.
+    - If only text is returned, looks for a data URL or raw base64.
+    Returns PIL.Image or None.
     """
     try:
         buffered = io.BytesIO()
-        # Provide best input quality
         image = image.convert("RGB")
         image.save(buffered, format="JPEG", quality=100)
         img_base64 = base64.b64encode(buffered.getvalue()).decode()
@@ -119,18 +109,14 @@ def enhance_with_gemini_direct(image: Image.Image, api_key: str, model_name: str
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
 
         prompt = f"""
-You are an expert studio photo retoucher. Apply ONLY the requested edits, preserving identity. 
-Aim for professional studio portrait quality with natural skin tones, clean lighting, and crisp details.
+You are an expert studio photo retoucher. Apply ONLY the requested edits, preserving identity and natural texture.
 
 Instructions:
 {instructions}
 
 Hard requirements:
-- Return a binary JPEG image (no text, no base64 string, no JSON) as the final content.
-- Face should be bright and clear, but skin must remain natural (no red cast, no waxy smoothing).
-- Remove harsh shadows on the face; even lighting.
-- Maintain natural texture; no plastic look.
-- Avoid changes to background unless explicitly requested.
+- If possible, return the ENHANCED IMAGE as base64 (prefer a data URL format like: data:image/jpeg;base64,....).
+- If you cannot return image bytes, respond with a single line JSON object: {{"note":"no_image_capability"}}.
 """
 
         payload = {
@@ -145,13 +131,11 @@ Hard requirements:
                     }
                 ]
             }],
-            # Ask for direct image bytes in response
             "generationConfig": {
                 "temperature": 0.1,
                 "topK": 1,
                 "topP": 1,
-                "maxOutputTokens": 1,  # We're not expecting text
-                "response_mime_type": "image/jpeg"
+                "maxOutputTokens": 2048
             }
         }
 
@@ -166,19 +150,48 @@ Hard requirements:
             st.error(f"API Error: {response.status_code} - {response.text[:200]}")
             return None
 
-        # Gemini v1beta can return mixed content; try to parse `inline_data` first.
         result = response.json()
 
-        # Try: some responses include image in candidates[0].content.parts with inline_data
+        # 1) Try standard inline_data
         if 'candidates' in result and len(result['candidates']) > 0:
             parts = result['candidates'][0].get('content', {}).get('parts', [])
+
             for part in parts:
                 if 'inline_data' in part and 'data' in part['inline_data']:
-                    img_data = base64.b64decode(part['inline_data']['data'])
-                    return Image.open(io.BytesIO(img_data)).convert("RGB")
+                    try:
+                        img_data = base64.b64decode(part['inline_data']['data'])
+                        return Image.open(io.BytesIO(img_data)).convert("RGB")
+                    except Exception:
+                        pass
 
-        # Some deployments may return a top-level "inline_data" or return raw bytes (unlikely in REST)
-        # If not found, fallback
+            # 2) Parse base64 from text parts
+            text_blobs = []
+            for part in parts:
+                if 'text' in part and isinstance(part['text'], str):
+                    text_blobs.append(part['text'])
+            combined = "\n".join(text_blobs).strip()
+
+            if combined:
+                # data URL
+                m = re.search(r'data:image/(?:jpeg|jpg|png);base64,([A-Za-z0-9+/=]+)', combined, re.IGNORECASE)
+                if m:
+                    try:
+                        img_data = base64.b64decode(m.group(1))
+                        return Image.open(io.BytesIO(img_data)).convert("RGB")
+                    except Exception:
+                        pass
+
+                # longest base64-ish chunk
+                candidates = re.findall(r'([A-Za-z0-9+/=\s]{200,})', combined)
+                candidates = [c.replace("\n", "").replace(" ", "") for c in candidates]
+                candidates = sorted(candidates, key=len, reverse=True)
+                for c in candidates[:3]:
+                    try:
+                        img_data = base64.b64decode(c)
+                        return Image.open(io.BytesIO(img_data)).convert("RGB")
+                    except Exception:
+                        continue
+
         return None
 
     except Exception as e:
@@ -189,7 +202,6 @@ Hard requirements:
 # Local PRO-grade fallback pipeline
 # ------------------------------
 def auto_white_balance_bgr(img_bgr):
-    # Gray-world assumption; robust against cast
     result = img_bgr.astype(np.float32)
     avg_b, avg_g, avg_r = np.mean(result[:,:,0]), np.mean(result[:,:,1]), np.mean(result[:,:,2])
     avg_gray = (avg_b + avg_g + avg_r) / 3.0
@@ -203,12 +215,10 @@ def auto_white_balance_bgr(img_bgr):
     return result
 
 def lift_shadows_preserve_highlights_bgr(img_bgr, strength=0.35):
-    # Work in LAB; lift L while preserving highlights via curve
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
-    L = L.astype(np.float32) / 255.0
-    # Smooth s-curve lifting lows more than highs
-    lifted = L + strength * (1 - np.exp(-3.0 * L))
+    Lf = L.astype(np.float32) / 255.0
+    lifted = Lf + strength * (1 - np.exp(-3.0 * Lf))
     lifted = np.clip(lifted, 0, 1)
     L_out = (lifted * 255).astype(np.uint8)
     lab = cv2.merge([L_out, A, B])
@@ -223,7 +233,6 @@ def local_contrast_bgr(img_bgr, clip_limit=2.0, tile_grid=(8,8)):
     return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
 def gentle_skin_tone_balance_bgr(img_bgr, reduce_red=5, calm_yellow=3):
-    # Slightly reduce A (red/green) and B (yellow/blue) in LAB to avoid redness/yellowness
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
     A = cv2.add(A, np.full_like(A, -reduce_red))
@@ -232,15 +241,13 @@ def gentle_skin_tone_balance_bgr(img_bgr, reduce_red=5, calm_yellow=3):
     return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
 def mild_sharpen_bgr(img_bgr, amount=0.7, radius=1):
-    # Unsharp mask-ish
     blur = cv2.GaussianBlur(img_bgr, (radius*2+1, radius*2+1), 0)
     sharp = cv2.addWeighted(img_bgr, 1 + amount, blur, -amount, 0)
     return sharp
 
 def eye_teeth_pop(pil_img, face_boxes, lift=0.08):
     """
-    Gentle local brightness boost around eyes & teeth area (if faces found).
-    Not attempting semantic segmentation—soft edged lift in upper central region of each face.
+    Subtle brightness lift around eyes/teeth area.
     """
     if len(face_boxes) == 0:
         return pil_img
@@ -249,16 +256,13 @@ def eye_teeth_pop(pil_img, face_boxes, lift=0.08):
     mask = np.zeros((h, w), dtype=np.float32)
 
     for (x, y, fw, fh) in face_boxes:
-        # heuristic rectangles for eyes/teeth region
         eye_y1 = int(y + fh*0.25)
         eye_y2 = int(y + fh*0.55)
         x1 = int(x + fw*0.15)
         x2 = int(x + fw*0.85)
-
-        # Soft mask
         region = np.zeros_like(mask)
         region[eye_y1:eye_y2, x1:x2] = 1.0
-        region = cv2.GaussianBlur(region, (0,0), fh*0.08)
+        region = cv2.GaussianBlur(region, (0,0), max(1, int(fh*0.08)))
         mask = np.maximum(mask, region)
 
     mask = np.clip(mask, 0, 1) * lift
@@ -271,13 +275,12 @@ def eye_teeth_pop(pil_img, face_boxes, lift=0.08):
 
 def background_cleanup(pil_img, mode="keep", bg_color=(245,245,245)):
     """
-    mode: "keep" (no change), "clean" (subtle denoise/blur), "remove" (cut and set solid bg)
+    mode: "keep" (no change), "clean" (denoise background), "remove" (cut subject, replace with solid bg)
     """
     if mode == "keep":
         return pil_img
 
     if mode == "clean":
-        # light bilateral filter to smooth blotchy backgrounds
         img = np.array(pil_img.convert("RGB"))
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         clean = cv2.bilateralFilter(img_bgr, d=7, sigmaColor=40, sigmaSpace=40)
@@ -301,37 +304,26 @@ def enhance_with_gemini_fallback(image: Image.Image, instructions: str,
     """
     PRO-grade local pipeline for reliable studio-like portrait enhancement.
     """
-    # EXIF orientation fix
     img = ImageOps.exif_transpose(image).convert("RGB")
     if face_crop:
         img = face_focus_crop(img, target_aspect=3/4, pad=0.20)
 
-    # Convert to BGR for OpenCV steps
     bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-    # White balance
     bgr = auto_white_balance_bgr(bgr)
-    # Lift shadows
     bgr = lift_shadows_preserve_highlights_bgr(bgr, strength=strength_bright)
-    # Gentle skin tone balance
     bgr = gentle_skin_tone_balance_bgr(bgr, reduce_red=5, calm_yellow=3)
-    # Local contrast
     bgr = local_contrast_bgr(bgr, clip_limit=contrast_clip, tile_grid=(8,8))
-    # Mild sharpen
     bgr = mild_sharpen_bgr(bgr, amount=sharpen_amt, radius=1)
 
     out = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
-    # Eyes/teeth gentle pop if faces visible
     faces = detect_faces_bboxes(out)
     out = eye_teeth_pop(out, faces, lift=0.07)
 
-    # Optional background cleanup or removal
     out = background_cleanup(out, mode=bg_mode, bg_color=(245,245,245))
 
-    # Subtle overall vibrance (Pillow)
     out = ImageEnhance.Color(out).enhance(1.06)
-    # Subtle clarity
     out = out.filter(ImageFilter.UnsharpMask(radius=1, percent=60, threshold=3))
 
     return out
@@ -406,7 +398,6 @@ if uploaded_file and enhance_btn:
         with col2:
             st.subheader("✨ AI Enhanced")
 
-            # Build instructions string
             if style == "Custom":
                 inst = custom_instructions
             else:
@@ -431,7 +422,7 @@ if uploaded_file and enhance_btn:
                         bg_mode=bg_mode,
                         face_crop=face_crop
                     )
-                st.info("ℹ️ Using built-in enhancement (fallback pipeline)")
+                st.info("ℹ️ Gemini model/endpoint returned text only or no image. Using built-in pro-grade enhancement.")
 
             st.image(enhanced, use_container_width=True)
             if used_gemini:
